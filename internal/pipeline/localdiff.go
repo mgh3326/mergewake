@@ -230,7 +230,7 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 				return nil, fmt.Errorf("read base commit %s: %w", commit, err)
 			}
 			commitParents := strings.Fields(parentText)
-			args := []string{"diff-tree", "--no-commit-id", "--unified=0", "--no-ext-diff", "-r", "--name-only", "-z"}
+			args := []string{"diff-tree", "--no-commit-id", "--no-ext-diff", "-r", "--name-only", "-z"}
 			if len(commitParents) == 1 {
 				args = append(args, "--root", commit)
 			} else {
@@ -244,43 +244,27 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 				if path == "" {
 					continue
 				}
-				diffArgs := []string{"diff", "--no-ext-diff", "--no-color", "--unified=0"}
-				if len(commitParents) == 1 {
-					diffArgs = append(diffArgs, "--root", commit)
-				} else {
-					diffArgs = append(diffArgs, commitParents[1], commit)
-				}
-				diffArgs = append(diffArgs, "--", path)
-				diff, err := git(diffArgs...)
+				atSecondParent, err := fileLineOriginCount(git, parents[2], path, commit, fileCache)
 				if err != nil {
-					return nil, fmt.Errorf("read added lines for %s:%s: %w", commit, path, err)
+					return nil, fmt.Errorf("read second-parent line origins for %s: %w", path, err)
 				}
-				if len(diff) >= 4<<20 {
-					return nil, fmt.Errorf("base-drop diff for %s exceeds runner output limit", path)
+				lineCount += atSecondParent
+				if lineCount > baseDropLineLimit {
+					return nil, fmt.Errorf("base history exceeds %d added lines", baseDropLineLimit)
 				}
-				for _, text := range addedHunkLines(diff) {
-					lineCount++
-					if lineCount > baseDropLineLimit {
-						return nil, fmt.Errorf("base history exceeds %d added lines", baseDropLineLimit)
-					}
-					atSecondParent, err := fileHasLineCount(git, parents[2], path, text, fileCache)
-					if err != nil {
-						return nil, fmt.Errorf("read second-parent file %s: %w", path, err)
-					}
-					if atSecondParent == 0 {
-						continue
-					}
-					mergePath := path
-					if renamed, ok := renames[path]; ok {
-						mergePath = renamed
-					}
-					inMerge, err := fileHasLineCount(git, merge, mergePath, text, fileCache)
-					if err != nil {
-						return nil, fmt.Errorf("read merge file %s: %w", mergePath, err)
-					}
-					if inMerge < atSecondParent {
-						affected[commit] = true
-					}
+				if atSecondParent == 0 {
+					continue
+				}
+				mergePath := path
+				if renamed, ok := renames[path]; ok {
+					mergePath = renamed
+				}
+				inMerge, err := fileLineOriginCount(git, merge, mergePath, commit, fileCache)
+				if err != nil {
+					return nil, fmt.Errorf("read merge line origins for %s: %w", mergePath, err)
+				}
+				if inMerge < atSecondParent {
+					affected[commit] = true
 				}
 			}
 		}
@@ -324,25 +308,6 @@ func nonemptyLines(text string) []string {
 	return lines
 }
 
-func addedHunkLines(diff string) []string {
-	var result []string
-	insideHunk := false
-	for _, line := range strings.Split(diff, "\n") {
-		if strings.HasPrefix(line, "diff --git ") {
-			insideHunk = false
-			continue
-		}
-		if strings.HasPrefix(line, "@@") {
-			insideHunk = true
-			continue
-		}
-		if insideHunk && strings.HasPrefix(line, "+") {
-			result = append(result, strings.TrimPrefix(line, "+"))
-		}
-	}
-	return result
-}
-
 func renamedPaths(status string) map[string]string {
 	fields := strings.Split(status, "\x00")
 	result := map[string]string{}
@@ -362,46 +327,48 @@ func renamedPaths(status string) map[string]string {
 	return result
 }
 
-func fileHasLineCount(git func(...string) (string, error), revision, path, want string, cache map[string]map[string]map[string]int) (int, error) {
+func fileLineOriginCount(git func(...string) (string, error), revision, path, origin string, cache map[string]map[string]map[string]int) (int, error) {
 	byPath := cache[revision]
 	if byPath == nil {
 		byPath = map[string]map[string]int{}
 		cache[revision] = byPath
 	}
-	lines, ok := byPath[path]
-	if !ok {
-		var err error
-		lines, err = fileLineCounts(git, revision, path)
-		if err != nil {
-			return 0, err
-		}
-		byPath[path] = lines
+	if counts, ok := byPath[path]; ok {
+		return counts[origin], nil
 	}
-	return lines[want], nil
-}
-
-func fileLineCounts(git func(...string) (string, error), revision, path string) (map[string]int, error) {
-	text, err := git("show", revision+":"+path)
+	pathspec := ":(literal)" + path
+	text, err := git("blame", "--root", "--line-porcelain", revision, "--", path)
 	if err != nil {
-		// A missing path means the line is absent. Check the tree separately so
-		// a missing blob or other object error fails closed.
-		tree, treeErr := git("ls-tree", "-r", "--name-only", "-z", revision, "--", path)
+		// A missing path has no blamed lines. Query one literal path so a
+		// missing blob or other object error still fails closed.
+		tree, treeErr := git("ls-tree", "-r", "--name-only", "-z", revision, "--", pathspec)
 		if treeErr != nil {
-			return nil, treeErr
+			return 0, treeErr
 		}
 		if len(tree) == 0 {
-			return map[string]int{}, nil
+			byPath[path] = map[string]int{}
+			return 0, nil
 		}
-		return nil, err
+		return 0, err
 	}
 	if len(text) >= 4<<20 {
-		return nil, fmt.Errorf("base-drop file %s exceeds runner output limit", path)
+		return 0, fmt.Errorf("base-drop blame for %s exceeds runner output limit", path)
 	}
-	lines := make(map[string]int)
+	counts := map[string]int{}
 	for _, line := range strings.Split(text, "\n") {
-		lines[line]++
+		fields := strings.Fields(line)
+		if len(fields) >= 3 && len(fields) <= 4 && len(fields[0]) >= 40 {
+			if _, err := strconv.Atoi(fields[1]); err != nil {
+				continue
+			}
+			if _, err := strconv.Atoi(fields[2]); err != nil {
+				continue
+			}
+			counts[strings.TrimPrefix(fields[0], "^")]++
+		}
 	}
-	return lines, nil
+	byPath[path] = counts
+	return counts[origin], nil
 }
 
 // boundDiff applies reviewDiffBudget to a GitHub API patch. A patch within the

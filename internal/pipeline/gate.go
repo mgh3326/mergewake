@@ -543,7 +543,6 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 		if s.Log != nil {
 			s.Log.Warn("base-drop verification failed", "repo", r.Name, "pr", pr.Number, "head", pr.Head.SHA, "error", v.BaseDropError)
 		}
-		_ = s.audit(r.Name, "base-drop-error", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "error": v.BaseDropError}, false)
 		v.Reasons = append(v.Reasons, "base_change_dropped:unknown")
 	} else if len(dropped) > 0 {
 		v.BaseChangesDropped = dropped

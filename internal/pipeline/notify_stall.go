@@ -242,6 +242,50 @@ func (s *Service) reviewWaitsFile(repo string) string {
 	return filepath.Join(s.state(repo), "pr-review-wait.json")
 }
 
+func (s *Service) baseDropWaitsFile(repo string) string {
+	return filepath.Join(s.state(repo), "pr-base-drop-wait.json")
+}
+
+func (s *Service) baseDropWaitSince(r config.Repo, pr github.Pull) (time.Time, error) {
+	file := s.baseDropWaitsFile(r.Name)
+	defer lockPath(file)()
+	waits := map[string]reviewWait{}
+	if found, err := fsutil.ReadJSON(file, &waits); found && err != nil {
+		return time.Time{}, fmt.Errorf("%s: %w", file, err)
+	} else if err != nil {
+		return time.Time{}, err
+	}
+	now := s.now().UTC()
+	key := fmt.Sprintf("%d %s", pr.Number, pr.Head.SHA)
+	if wait, ok := waits[key]; ok {
+		return wait.First, nil
+	}
+	for other, wait := range waits {
+		if wait.First.Before(now.Add(-7 * 24 * time.Hour)) {
+			delete(waits, other)
+		}
+	}
+	waits[key] = reviewWait{First: now}
+	return now, fsutil.WriteJSON(file, waits)
+}
+
+func (s *Service) clearBaseDropWait(r config.Repo, pr github.Pull) error {
+	file := s.baseDropWaitsFile(r.Name)
+	defer lockPath(file)()
+	waits := map[string]reviewWait{}
+	if found, err := fsutil.ReadJSON(file, &waits); found && err != nil {
+		return fmt.Errorf("%s: %w", file, err)
+	} else if err != nil {
+		return err
+	}
+	key := fmt.Sprintf("%d %s", pr.Number, pr.Head.SHA)
+	if _, ok := waits[key]; !ok {
+		return nil
+	}
+	delete(waits, key)
+	return fsutil.WriteJSON(file, waits)
+}
+
 // reviewWaitSince returns when this (PR, head) was first seen with an
 // internal review wait, recording it on the first sight. The clock survives
 // daemon restarts; entries untouched for a week are dropped.
@@ -390,14 +434,11 @@ func (s *Service) baseDropStalled(ctx context.Context, r config.Repo, pr github.
 	if err != nil {
 		return "", "", false, err
 	}
-	key := fmt.Sprintf("base-drop-stalled %d %s", pr.Number, pr.Head.SHA)
+	key := fmt.Sprintf("base-drop-stalled %d %s %d", pr.Number, pr.Head.SHA, since.UnixNano())
 	if sent.has(key) {
 		return "", "", false, nil
 	}
-	lane, via, err := s.notifyLane(ctx, r, pr)
-	if err != nil {
-		return "", "", false, err
-	}
+	lane, via := s.ownerLane(r), "owner lane"
 	if detail == "" {
 		detail = "verification failed"
 	}
@@ -407,7 +448,7 @@ func (s *Service) baseDropStalled(ctx context.Context, r config.Repo, pr github.
 	text := fmt.Sprintf("[mergewake] STALLED %s#%d head=%s | internal base-change verification failed for %s: %s | lane=%s via %s", r.Name, pr.Number, short7(pr.Head.SHA), waited.Round(time.Minute), detail, lane, via)
 	reportCtx, cancel := reportContext(ctx)
 	defer cancel()
-	if err = s.Notifier.Notify(reportCtx, integrations.Event{ID: fmt.Sprintf("mergewake-base-drop-stalled-%s-%d-%s", r.Name, pr.Number, pr.Head.SHA), Text: text, Lane: lane, Type: eventType("blocked")}); err != nil {
+	if err = s.Notifier.Notify(reportCtx, integrations.Event{ID: fmt.Sprintf("mergewake-base-drop-stalled-%s-%d-%s-%d", r.Name, pr.Number, pr.Head.SHA, since.UnixNano()), Text: text, Lane: lane, Type: eventType("blocked")}); err != nil {
 		return "", "", false, fmt.Errorf("%w: %s", errNotifyDelivery, integrations.Detail(err))
 	}
 	if err = sent.add(key); err != nil {

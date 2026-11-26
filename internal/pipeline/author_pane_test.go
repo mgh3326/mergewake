@@ -31,6 +31,7 @@ func authorHost(panes ...aPane) *scriptRunner {
 		outs[key("git", "-C", p.cwd, "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel")] = "/repo/.git/worktrees/" + p.id + "\n/repo/.git\n" + p.cwd + "\n"
 		outs[key("git", "-C", p.cwd, "branch", "--show-current")] = p.branch + "\n"
 		outs[key("git", "-C", p.cwd, "rev-parse", "HEAD")] = "aaaa\n"
+		outs[key("git", "-C", p.cwd, "rev-parse", "--is-shallow-repository")] = "false\n"
 		outs[key("git", "-C", p.cwd, "remote", "get-url", "origin")] = p.origin + "\n"
 	}
 	outs[key("herdr", "agent", "list")] = `{"result":{"agents":[` + strings.Join(agents, ",") + `]}}`
@@ -269,7 +270,7 @@ func TestPartialAuthorScanReadyRecordKeepsBoundLane(t *testing.T) {
 	sink := s.Sink.(*jobSink)
 	sink.recs["w-9"] = integrations.JobRecord{State: "spawned", Role: "worker", Label: "w-9", HubLane: "w-9-lane"}
 	run := authorHost(paneB)
-	s.Runner = run
+	s.Runner = noMergeGitRunner{next: run}
 	setPartialAuthorScan(s, run)
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)
@@ -277,6 +278,24 @@ func TestPartialAuthorScanReadyRecordKeepsBoundLane(t *testing.T) {
 	rows := prNotifyRows(t, s, r)
 	if len(rows) != 1 || rows[0]["lane"] != "worker-lane" || !strings.Contains(fmt.Sprint(rows[0]["via"]), "partial pane scan") {
 		t.Fatalf("partial READY route: %+v", rows)
+	}
+}
+
+func TestBaseDropStallRoutesToOwnerInsteadOfAuthorPane(t *testing.T) {
+	s, _, n, r := workerNotifySetup(t)
+	r.Lane = "repo-operator"
+	s.Config.Hosts = []reap.Host{{Name: "local"}}
+	sink := s.Sink.(*jobSink)
+	delete(sink.jobs, "42")
+	run := authorHost(aPane{"w1:p1", "w-9", "/wt/a", "feature", projectOrigin})
+	s.Runner = run
+	pr := s.GH.(*fakeGH).pull
+	_, _, sent, err := s.baseDropStalled(context.Background(), r, pr, "fetch unavailable", s.now().Add(-reviewStallAfter-time.Minute))
+	if err != nil || !sent {
+		t.Fatalf("owner alert sent=%t err=%v", sent, err)
+	}
+	if len(n.events) != 1 || n.events[0].Lane != s.ownerLane(r) {
+		t.Fatalf("internal verification alert went to author route: %+v", n.events)
 	}
 }
 
@@ -336,7 +355,7 @@ func TestPartialAuthorScanWithoutBoundJobRoutesOnAnsweringHost(t *testing.T) {
 func TestPartialAuthorScanWorkerVerdictRouteAndReadyAudit(t *testing.T) {
 	s, _, _, r := workerNotifySetup(t)
 	run := authorHost()
-	s.Runner = run
+	s.Runner = noMergeGitRunner{next: run}
 	setPartialAuthorScan(s, run)
 	if e := s.NotifyPR(context.Background(), r, 7, Options{}); e != nil {
 		t.Fatal(e)

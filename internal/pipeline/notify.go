@@ -118,6 +118,17 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		}
 		return e
 	}
+	var baseDropSince time.Time
+	if o.Reporting() {
+		if slices.Contains(v.Reasons, "base_change_dropped:unknown") {
+			baseDropSince, e = s.baseDropWaitSince(r, pr)
+		} else {
+			e = s.clearBaseDropWait(r, pr)
+		}
+		if e != nil {
+			return e
+		}
+	}
 	if o.Reporting() {
 		if e := notifyStep(ctx, "stalls", func() error { return s.notifyPRStalls(ctx, r, pr, p) }); e != nil {
 			if err := s.stallClockError(ctx, r, pr, prCheckRedCause, e); err != nil {
@@ -177,24 +188,26 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		conflicted = slices.Contains(reasons, "conflict")
 		reasons = slices.DeleteFunc(slices.Clone(reasons), func(reason string) bool { return reason == "conflict" })
 		if waiting {
-			since, e := s.reviewWaitSince(r, pr)
-			if e != nil {
-				return e
+			if slices.Contains(v.Reasons, "base_change_dropped:unknown") {
+				lane, via, sent, e := s.baseDropStalled(ctx, r, pr, v.BaseDropError, baseDropSince)
+				if e != nil {
+					if !errors.Is(e, errNotifyDelivery) {
+						return e
+					}
+					record.Via, record.Error = "delivery-failed", e.Error()
+					return s.audit(r.Name, "pr-notify", record, false)
+				}
+				if sent {
+					record.Reasons, record.Lane, record.Via, record.Sent = []string{"base_change_dropped:unknown"}, lane, via, true
+				}
 			}
 			if len(reasons) == 0 && !conflicted {
 				if slices.Contains(v.Reasons, "base_change_dropped:unknown") {
-					lane, via, sent, e := s.baseDropStalled(ctx, r, pr, v.BaseDropError, since)
-					if e != nil {
-						if !errors.Is(e, errNotifyDelivery) {
-							return e
-						}
-						record.Via, record.Error = "delivery-failed", e.Error()
-						return s.audit(r.Name, "pr-notify", record, false)
-					}
-					if sent {
-						record.Reasons, record.Lane, record.Via, record.Sent = []string{"base_change_dropped:unknown"}, lane, via, true
-					}
 					return s.audit(r.Name, "pr-notify", record, false)
+				}
+				since, e := s.reviewWaitSince(r, pr)
+				if e != nil {
+					return e
 				}
 				// Only mergewake's own queue holds the head: nothing for any
 				// session to do until the wait outlasts reviewStallAfter.
@@ -308,7 +321,7 @@ func baseChangeDropNotice(v gateVerdict, branches ...string) string {
 		if extra > 0 {
 			detail += fmt.Sprintf(" and %d more", extra)
 		}
-		return detail + "; ask the desk to merge origin/" + branch + " after review"
+		return detail + "; ask the desk to rebuild the faulty merge from origin/" + branch + " while preserving PR changes after review"
 	}
 	return ""
 }
