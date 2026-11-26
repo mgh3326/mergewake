@@ -157,14 +157,19 @@ func uniqueSorted(names []string) []string {
 var authorScanTTL = 30 * time.Second
 
 // authorHostScanBound caps one host's pane scan on the author path (notify and
-// route), so one host can never hold a route longer than this, whatever the
-// error shape. It bounds the whole host, not each call: a scan makes one call
-// per pane. It must sit above what a healthy scan costs: reap measured 25 to
-// 89 s per host (reap_pass_hosts.go), so 120 s leaves room above the top of
+// route). Hosts scan concurrently, so one hung host cannot make the route wait
+// for the sum of the configured hosts' bounds. It bounds the whole host, not
+// each call: a scan makes one call per pane. It must sit above healthy scan
+// costs: reap measured 25 to 89 s per host (reap_pass_hosts.go), so 120 s
+// leaves room above the top of
 // that range. A hung node does not wait for this bound: its first call fails
 // at the hub's 45 s client timeout, and the host fails there. Expiry fails the
 // host for the TTL, and the route goes on with the hosts that answered.
 var authorHostScanBound = 120 * time.Second
+
+var authorHostScanFunc = func(s *Service, ctx context.Context, hub *reap.Hub, h reap.Host) *reapHost {
+	return s.hostScan(ctx, hub, h)
+}
 
 // hostScanMu guards Service.hostScans. Like the other Service caches, the map
 // is shared by copies of a Service.
@@ -260,9 +265,20 @@ func (s *Service) authorHosts(ctx context.Context) ([]*reapHost, error) {
 			scan.err = e
 			return
 		}
+		hosts := s.Config.Hosts
+		results := make([]*reapHost, len(hosts))
+		var wg sync.WaitGroup
+		for i, h := range hosts {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				results[i] = authorHostScanFunc(s, ctx, hub, h)
+			}()
+		}
+		wg.Wait()
 		var errs []error
-		for _, h := range s.Config.Hosts {
-			hs := s.hostScan(ctx, hub, h)
+		for i, hs := range results {
+			h := hosts[i]
 			if hs.failed {
 				errs = append(errs, hostScanError{h.Name})
 				scan.failedHosts = append(scan.failedHosts, h.Name)

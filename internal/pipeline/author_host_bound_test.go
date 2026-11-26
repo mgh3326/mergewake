@@ -175,3 +175,40 @@ func TestAuthorHostScanBoundCoversMeasuredScan(t *testing.T) {
 		t.Fatalf("authorHostScanBound = %v, want above the measured %v scan cost", authorHostScanBound, measuredMax)
 	}
 }
+
+func TestAuthorHostsBoundedConcurrentlyInConfigOrder(t *testing.T) {
+	s, _, _ := authorPaneSetup(t, paneB)
+	s.Config.Reap.Transport = "ssh"
+	s.Config.Hosts = []reap.Host{{Name: "first"}, {Name: "second"}, {Name: "healthy"}}
+	withAuthorHostBound(t, 150*time.Millisecond)
+	oldScan := authorHostScanFunc
+	authorHostScanFunc = func(_ *Service, ctx context.Context, _ *reap.Hub, h reap.Host) *reapHost {
+		if h.Name != "healthy" {
+			scan, cancel := context.WithTimeout(ctx, authorHostScanBound)
+			defer cancel()
+			<-scan.Done()
+			return &reapHost{host: h, failed: true}
+		}
+		return &reapHost{host: h}
+	}
+	t.Cleanup(func() { authorHostScanFunc = oldScan })
+	ctx := WithAuthorScan(context.Background())
+	start := time.Now()
+	hosts, err := s.authorHosts(ctx)
+	elapsed := time.Since(start)
+	if !hostScanOnly(err) {
+		t.Fatalf("authorHosts error %v, want failures for both hanging hosts", err)
+	}
+	if elapsed > 250*time.Millisecond {
+		t.Fatalf("authorHosts took %v with a 150ms host bound, want about one bound", elapsed)
+	}
+	if got, want := []string{hosts[0].host.Name, hosts[1].host.Name, hosts[2].host.Name}, []string{"first", "second", "healthy"}; !slices.Equal(got, want) {
+		t.Fatalf("host order %v, want %v", got, want)
+	}
+	if !hosts[0].failed || !hosts[1].failed || hosts[2].failed {
+		t.Fatalf("host failures = [%v %v %v], want [true true false]", hosts[0].failed, hosts[1].failed, hosts[2].failed)
+	}
+	if got, want := authorScanFailures(ctx), []string{"first", "second"}; !slices.Equal(got, want) {
+		t.Fatalf("failedHosts order %v, want %v", got, want)
+	}
+}
