@@ -996,6 +996,15 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 		var place func(c context.Context, a []string) ([]byte, error)
 		place = func(c context.Context, a []string) ([]byte, error) {
 			b, refusal := launch(c, a)
+			if refusal != nil && slices.Contains(a, "--owner-notify") && ownerNotifyRefused(refusal) {
+				legacy := withoutFlag(a, "--owner-notify")
+				rj.Args = withoutFlag(rj.Args, "--owner-notify")
+				if saveErr := x.saveReviewerJob(rj); saveErr != nil {
+					return b, saveErr
+				}
+				note = "the hub does not support owner notification; the reviewer was placed without it"
+				return place(c, legacy)
+			}
 			if refusal != nil && checkoutSparseRefused(refusal) {
 				if full, ok := sparseFallbackArgs(a); ok {
 					reason := fleetevent.Redact(integrations.Detail(refusal))

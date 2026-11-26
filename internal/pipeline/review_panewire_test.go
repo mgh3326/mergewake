@@ -108,10 +108,11 @@ type panewireRunner struct {
 	sink       *taskJobSink
 	// hk serves a spawn whose brief is "-p hk:doc/<key>"; jobs is
 	// review.panewire.jobs, where such a spawn's same-host pane writes.
-	hk            *hktest.Server
-	jobs          string
-	versionOutput string
-	versionErr    error
+	hk                    *hktest.Server
+	jobs                  string
+	versionOutput         string
+	versionErr            error
+	ownerNotifyHubRefused bool
 }
 
 func (r *panewireRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
@@ -199,8 +200,11 @@ func (r *panewireRunner) run(ctx context.Context, command string, args []string,
 			return nil, r.usageErr
 		}
 		return r.fakeRunner.Run(ctx, command, args, input, dir)
-	case "panewire", "panewire-test-supported", "panewire-test-unsupported", "panewire-test-probe-failure":
+	case "panewire", "panewire-test-supported", "panewire-test-unsupported", "panewire-test-probe-failure", "panewire-test-hub-refused":
 		r.spawns = append(r.spawns, args)
+		if r.ownerNotifyHubRefused && slices.Contains(args, "--owner-notify") {
+			return nil, &integrations.CommandError{Command: "panewire", Err: panewireExit(2), Stderr: "spawn response is uncertain or refused; replay this same command and receipt request=0: hub does not support --owner-notify; upgrade the hub before submitting"}
+		}
 		if r.sparseRefused && slices.Contains(args, "--checkout-exclude") {
 			// panewire's pre-submit sparse feature check: no request, job or pane.
 			return nil, &integrations.CommandError{Command: "panewire", Err: panewireExit(2), Stderr: "spawn response is uncertain or refused; replay this same command and receipt request=0: hub does not support --checkout-exclude; upgrade the hub before submitting"}
@@ -508,6 +512,29 @@ func TestPanewirePassPostsPaneFindings(t *testing.T) {
 	diff, _ := g.Diff(context.Background(), "", 0)
 	if (got != github.PassReceipt{Pass: 1, Lens: "default", Reviewer: "panewire:seat-x", Family: "openai", SameFamily: false, AuthorFamily: "anthropic", Executor: "panewire", Round: 1, Patch: reviewPatchID(diff)}) {
 		t.Fatalf("%+v", got)
+	}
+}
+
+func TestReviewerOwnerNotifyFallsBackWhenHubLacksSupport(t *testing.T) {
+	runner := &panewireRunner{family: "openai", findings: `{"findings":[]}`, ownerNotifyHubRefused: true}
+	s, _, repo := panewireSetup(t, runner)
+	s.Config.Review.Panewire.Command = "panewire-test-hub-refused"
+	var saved reviewerJob
+	runner.afterRun = func() {
+		if len(runner.spawns) == 2 {
+			if b, err := os.ReadFile(s.reviewerJobPath(repo.Name, 7, 1)); err == nil {
+				_ = json.Unmarshal(b, &saved)
+			}
+		}
+	}
+	if err := s.Review(context.Background(), repo, 7, "", Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(runner.spawns) != 2 || !slices.Contains(runner.spawns[0], "--owner-notify") || slices.Contains(runner.spawns[1], "--owner-notify") {
+		t.Fatalf("hub compatibility retries: %v", runner.spawns)
+	}
+	if slices.Contains(saved.Args, "--owner-notify") {
+		t.Fatalf("saved replay args retain the unsupported flag: %v", saved.Args)
 	}
 }
 
