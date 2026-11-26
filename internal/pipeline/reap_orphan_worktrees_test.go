@@ -257,6 +257,38 @@ func TestOrphanWorktreeDiscoveryDoesNotSpendBudgetOnMarkerChecks(t *testing.T) {
 	}
 }
 
+type slowOrphanListRunner struct {
+	integrations.Exec
+	started bool
+}
+
+func (r *slowOrphanListRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	if command == "git" && len(args) >= 4 && args[len(args)-3] == "worktree" && args[len(args)-2] == "list" {
+		r.started = true
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return r.Exec.Run(ctx, command, args, input, dir)
+}
+
+func TestOrphanWorktreeInspectsBeforeSlowLaterHostListing(t *testing.T) {
+	a := newOrphanFixture(t, "wk/a", false)
+	b := newOrphanFixture(t, "", false)
+	a.hs.host.Name, b.hs.host.Name = "a", "b"
+	a.hs.host.WorkRoot, b.hs.host.WorkRoot = a.root, b.root
+	a.s.Config.Hosts = []reap.Host{a.hs.host, b.hs.host}
+	slow := &slowOrphanListRunner{}
+	b.hs.exec.Runner = slow
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	ctx = context.WithValue(ctx, reapBudgetKey{}, reapBudget{deadline: time.Now().Add(150 * time.Millisecond), passDeadline: time.Now().Add(150 * time.Millisecond)})
+	var rows []reapReceipt
+	_ = a.s.reapOrphanWorktrees(ctx, testRepo, []*reapHost{a.hs, b.hs}, false, false, func(r reapReceipt) { rows = append(rows, r) })
+	if !slow.started || len(rows) != 1 || rows[0].Host != "a" {
+		t.Fatalf("later listing started=%v, inspected rows=%+v", slow.started, rows)
+	}
+}
+
 func TestOrphanWorktreeDryRunDoesNotWriteCursor(t *testing.T) {
 	f := newOrphanFixture(t, "", false)
 	errs := f.s.reapOrphanWorktrees(context.Background(), testRepo, []*reapHost{f.hs}, false, false, func(reapReceipt) {})

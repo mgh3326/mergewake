@@ -77,7 +77,8 @@ func (s *Service) reapOrphanWorktrees(ctx context.Context, r config.Repo, hosts 
 	var errs []error
 	orderedHosts := append([]*reapHost(nil), hosts...)
 	sort.SliceStable(orderedHosts, func(i, j int) bool { return orderedHosts[i].host.Name < orderedHosts[j].host.Name })
-	var visits []orphanWorktreeVisit
+	visited := map[string]int{}
+	lastVisited := map[string]string{}
 	var budgetStopped bool
 	for _, hs := range orderedHosts {
 		if err := reapBudgetCheck(ctx, "orphan worktree discovery"); err != nil {
@@ -93,7 +94,7 @@ func (s *Service) reapOrphanWorktrees(ctx context.Context, r config.Repo, hosts 
 		if hs.host.WorkRoot == "" || hs.failed {
 			continue
 		}
-		for _, kind := range []string{"exp", "detached", "branch", "wk-no-pr", "other"} {
+		for _, kind := range []string{"exp", "detached", "branch", "worker-owned", "other"} {
 			counts[hs.host.Name+"\x00"+kind] = 0
 		}
 		main := filepath.Join(hs.host.WorkRoot, repoSegment(r.Name))
@@ -145,8 +146,7 @@ func (s *Service) reapOrphanWorktrees(ctx context.Context, r config.Repo, hosts 
 				continue
 			}
 			// The canonical clone and arbitrary directories never qualify: require
-			// the worktree marker and a registration in this clone's worktree list.
-			// WorktreeEntries is the registration proof. Inspect validates identity
+			// registration in this clone's worktree list. Inspect validates identity
 			// before any removal; a separate test -f per entry made discovery
 			// unbounded and could consume the entire stage budget.
 			if owned[path] {
@@ -155,150 +155,144 @@ func (s *Service) reapOrphanWorktrees(ctx context.Context, r config.Repo, hosts 
 			candidates = append(candidates, entry)
 		}
 		sort.Slice(candidates, func(i, j int) bool { return candidates[i].Path < candidates[j].Path })
+		var visits []orphanWorktreeVisit
 		for _, entry := range candidates {
 			visits = append(visits, orphanWorktreeVisit{hs.host.Name, hs, entry})
 		}
-	}
-	// Resume independently per host so a small host cannot move another host's
-	// cursor past candidates hidden by its per-host limit.
-	byHost := map[string][]orphanWorktreeVisit{}
-	for _, v := range visits {
-		byHost[v.host] = append(byHost[v.host], v)
-	}
-	visits = visits[:0]
-	for _, hs := range orderedHosts {
-		rows := byHost[hs.host.Name]
+		// Resume this host independently, then inspect its candidates before
+		// spending the remaining budget discovering another host.
 		cursor := orphanWorktreeCursor{Host: hs.host.Name, Path: from.Hosts[hs.host.Name]}
 		if from.Hosts == nil && from.Host == hs.host.Name {
 			cursor.Path = from.Path
 		}
-		visits = append(visits, resumeOrphanWorktreeVisits(rows, cursor)...)
-	}
-	visited := map[string]int{}
-	lastVisited := map[string]string{}
-	for _, visit := range visits {
-		hs, entry := visit.hs, visit.entry
-		main := filepath.Join(hs.host.WorkRoot, repoSegment(r.Name))
-		if visited[visit.host] >= limit {
-			continue
+		visits = resumeOrphanWorktreeVisits(visits, cursor)
+		for _, visit := range visits {
+			hs, entry := visit.hs, visit.entry
+			main := filepath.Join(hs.host.WorkRoot, repoSegment(r.Name))
+			if visited[visit.host] >= limit {
+				continue
+			}
+			if err := reapBudgetCheck(ctx, "orphan worktrees"); err != nil {
+				errs = append(errs, err)
+				budgetStopped = true
+				break
+			}
+			if err := budgetCut(ctx, ctx.Err(), "orphan worktree candidate"); err != nil {
+				errs = append(errs, err)
+				budgetStopped = true
+				break
+			}
+			visited[visit.host]++
+			lastVisited[visit.host] = entry.Path
+			kind := orphanWorktreeKind(entry)
+			rec := reapReceipt{Action: orphanWorktreeAction, Repo: r.Name, Host: hs.host.Name, Worktree: entry.Path, Branch: entry.Branch, Kind: kind}
+			keep := func(reason string) {
+				rec.Result, rec.Reason = "kept", reason
+				note(rec)
+				counts[hs.host.Name+"\x00"+kind]++
+			}
+			if entry.Locked {
+				keep("locked")
+				continue
+			}
+			if strings.HasPrefix(entry.Branch, workerBranchPrefix) {
+				keep("worker-owned")
+				continue
+			}
+			if hs.viaHub {
+				// Current node worktree.list exposes status summaries, but not the
+				// required no-lock status paths, filesystem mtimes, or fetch-free
+				// upstream refs. Keep until that evidence is available at the node.
+				keep("host-evidence-unavailable")
+				continue
+			}
+			wt, e := hs.exec.Inspect(ctx, entry.Path)
+			if e != nil || wt == nil || filepath.Clean(wt.Path) != filepath.Clean(entry.Path) || !strings.EqualFold(wt.Repo, r.Name) {
+				keep("worktree-identity-unknown")
+				continue
+			}
+			if ok, reason := orphanWorktreeClean(ctx, hs.exec, entry.Path, s.Config.ReapRegenerable(r)); !ok {
+				keep(reason)
+				continue
+			}
+			pushed, e := orphanWorktreePushed(ctx, hs.exec, entry.Path, wt.Head, wt.Branch, r.Branch)
+			if e != nil || !pushed {
+				keep("commits-not-proven-pushed")
+				continue
+			}
+			old, e := orphanWorktreeOld(ctx, hs.exec, entry.Path, age, s.now())
+			if e != nil || !old {
+				keep("younger-than-min-age-or-age-unknown")
+				continue
+			}
+			if e := hs.refreshPanes(ctx); e != nil {
+				errs = append(errs, fmt.Errorf("%s orphan worktrees pane scan: %w", hs.host.Name, e))
+				keep("pane-scan-failed")
+				continue
+			}
+			if hs.paneInUse(entry.Path) {
+				keep("pane-in-use")
+				continue
+			}
+			if !hs.host.Local() {
+				keep("process-scan-unavailable")
+				continue
+			}
+			if reason := s.processInUse(ctx, entry.Path); reason != "" {
+				keep(reason)
+				continue
+			}
+			if !acting {
+				rec.Result, rec.Reason = "would-remove", ""
+				note(rec)
+				counts[hs.host.Name+"\x00"+kind]++
+				continue
+			}
+			fresh, e := hs.exec.Inspect(ctx, entry.Path)
+			if e != nil || fresh == nil || filepath.Clean(fresh.Path) != filepath.Clean(wt.Path) || fresh.Head != wt.Head || fresh.Branch != wt.Branch || !strings.EqualFold(fresh.Repo, r.Name) {
+				keep("worktree-changed")
+				continue
+			}
+			if ok, reason := orphanWorktreeClean(ctx, hs.exec, entry.Path, s.Config.ReapRegenerable(r)); !ok {
+				keep(reason)
+				continue
+			}
+			if pushed, e := orphanWorktreePushed(ctx, hs.exec, entry.Path, fresh.Head, fresh.Branch, r.Branch); e != nil || !pushed {
+				keep("commits-not-proven-pushed")
+				continue
+			}
+			if old, e := orphanWorktreeOld(ctx, hs.exec, entry.Path, age, s.now()); e != nil || !old {
+				keep("younger-than-min-age-or-age-unknown")
+				continue
+			}
+			// Pane evidence is refreshed immediately before the non-forcing
+			// removal, after the other guards have been repeated.
+			if e := hs.refreshPanes(ctx); e != nil {
+				errs = append(errs, fmt.Errorf("%s orphan worktrees pane recheck: %w", hs.host.Name, e))
+				keep("pane-scan-failed")
+				continue
+			}
+			if hs.paneInUse(entry.Path) {
+				keep("pane-in-use")
+				continue
+			}
+			if reason := s.processInUse(ctx, entry.Path); reason != "" {
+				keep(reason)
+				continue
+			}
+			if e := hs.exec.RemoveWorktree(ctx, main, entry.Path); e != nil {
+				rec.Result, rec.Reason = "error", e.Error()
+				note(rec)
+				counts[hs.host.Name+"\x00"+kind]++
+				continue
+			}
+			rec.Result = "removed"
+			note(rec)
+			counts[hs.host.Name+"\x00"+kind]++
 		}
-		if err := reapBudgetCheck(ctx, "orphan worktrees"); err != nil {
-			errs = append(errs, err)
-			budgetStopped = true
+		if budgetStopped {
 			break
 		}
-		if err := budgetCut(ctx, ctx.Err(), "orphan worktree candidate"); err != nil {
-			errs = append(errs, err)
-			budgetStopped = true
-			break
-		}
-		visited[visit.host]++
-		lastVisited[visit.host] = entry.Path
-		kind := orphanWorktreeKind(entry)
-		rec := reapReceipt{Action: orphanWorktreeAction, Repo: r.Name, Host: hs.host.Name, Worktree: entry.Path, Branch: entry.Branch, Kind: kind}
-		keep := func(reason string) {
-			rec.Result, rec.Reason = "kept", reason
-			note(rec)
-			counts[hs.host.Name+"\x00"+kind]++
-		}
-		if entry.Locked {
-			keep("locked")
-			continue
-		}
-		if strings.HasPrefix(entry.Branch, workerBranchPrefix) {
-			keep("worker-owned")
-			continue
-		}
-		if hs.viaHub {
-			// Current node worktree.list exposes status summaries, but not the
-			// required no-lock status paths, filesystem mtimes, or fetch-free
-			// upstream refs. Keep until that evidence is available at the node.
-			keep("host-evidence-unavailable")
-			continue
-		}
-		wt, e := hs.exec.Inspect(ctx, entry.Path)
-		if e != nil || wt == nil || filepath.Clean(wt.Path) != filepath.Clean(entry.Path) || !strings.EqualFold(wt.Repo, r.Name) {
-			keep("worktree-identity-unknown")
-			continue
-		}
-		if ok, reason := orphanWorktreeClean(ctx, hs.exec, entry.Path, s.Config.ReapRegenerable(r)); !ok {
-			keep(reason)
-			continue
-		}
-		pushed, e := orphanWorktreePushed(ctx, hs.exec, entry.Path, wt.Head, wt.Branch, r.Branch)
-		if e != nil || !pushed {
-			keep("commits-not-proven-pushed")
-			continue
-		}
-		old, e := orphanWorktreeOld(ctx, hs.exec, entry.Path, age, s.now())
-		if e != nil || !old {
-			keep("younger-than-min-age-or-age-unknown")
-			continue
-		}
-		if e := hs.refreshPanes(ctx); e != nil {
-			errs = append(errs, fmt.Errorf("%s orphan worktrees pane scan: %w", hs.host.Name, e))
-			keep("pane-scan-failed")
-			continue
-		}
-		if hs.paneInUse(entry.Path) {
-			keep("pane-in-use")
-			continue
-		}
-		if !hs.host.Local() {
-			keep("process-scan-unavailable")
-			continue
-		}
-		if reason := s.processInUse(ctx, entry.Path); reason != "" {
-			keep(reason)
-			continue
-		}
-		if !acting {
-			rec.Result, rec.Reason = "would-remove", ""
-			note(rec)
-			counts[hs.host.Name+"\x00"+kind]++
-			continue
-		}
-		fresh, e := hs.exec.Inspect(ctx, entry.Path)
-		if e != nil || fresh == nil || filepath.Clean(fresh.Path) != filepath.Clean(wt.Path) || fresh.Head != wt.Head || fresh.Branch != wt.Branch || !strings.EqualFold(fresh.Repo, r.Name) {
-			keep("worktree-changed")
-			continue
-		}
-		if ok, reason := orphanWorktreeClean(ctx, hs.exec, entry.Path, s.Config.ReapRegenerable(r)); !ok {
-			keep(reason)
-			continue
-		}
-		if pushed, e := orphanWorktreePushed(ctx, hs.exec, entry.Path, fresh.Head, fresh.Branch, r.Branch); e != nil || !pushed {
-			keep("commits-not-proven-pushed")
-			continue
-		}
-		if old, e := orphanWorktreeOld(ctx, hs.exec, entry.Path, age, s.now()); e != nil || !old {
-			keep("younger-than-min-age-or-age-unknown")
-			continue
-		}
-		// Pane evidence is refreshed immediately before the non-forcing
-		// removal, after the other guards have been repeated.
-		if e := hs.refreshPanes(ctx); e != nil {
-			errs = append(errs, fmt.Errorf("%s orphan worktrees pane recheck: %w", hs.host.Name, e))
-			keep("pane-scan-failed")
-			continue
-		}
-		if hs.paneInUse(entry.Path) {
-			keep("pane-in-use")
-			continue
-		}
-		if reason := s.processInUse(ctx, entry.Path); reason != "" {
-			keep(reason)
-			continue
-		}
-		if e := hs.exec.RemoveWorktree(ctx, main, entry.Path); e != nil {
-			rec.Result, rec.Reason = "error", e.Error()
-			note(rec)
-			counts[hs.host.Name+"\x00"+kind]++
-			continue
-		}
-		rec.Result = "removed"
-		note(rec)
-		counts[hs.host.Name+"\x00"+kind]++
 	}
 	if durable && len(lastVisited) != 0 {
 		if from.Hosts == nil {
