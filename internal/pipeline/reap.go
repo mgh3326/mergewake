@@ -141,9 +141,10 @@ type reapHost struct {
 	// panesRead is set once the agent pane list was read in full, even when a
 	// later inspect failed the host: the list still answers liveness.
 	panesRead bool
-	// agentTreesRead is set once every agent pane's cwd of the host was
-	// inspected (the first list of reapScanHost's walk). A cut inside that list
-	// leaves it false; a cut in the full pane list after it leaves it true.
+	// agentTreesRead is set only when, after the agent pane list is walked,
+	// every agent pane with a non-empty cwd has an entry in trees. A cut inside
+	// that walk, or a tolerated inspect error, leaves a cwd without an entry
+	// and the flag false. A cut in the full pane list after it leaves it true.
 	agentTreesRead bool
 	// rootPath and rootErr memoize the resolved work root for this sweep.
 	rootPath     string
@@ -440,10 +441,24 @@ func (s *Service) reapScanHost(ctx context.Context, hub *reap.Hub, h reap.Host) 
 			}
 		}
 		if i == 0 {
-			hs.agentTreesRead = true
+			hs.agentTreesRead = agentTreesInspected(hs, panes)
 		}
 	}
 	return hs, errs
+}
+
+// agentTreesInspected reports whether every agent pane with a cwd has a tree
+// entry on hs, so a tolerated inspect error leaves the host incomplete.
+func agentTreesInspected(hs *reapHost, panes []reap.Pane) bool {
+	for _, p := range panes {
+		if p.Cwd == "" {
+			continue
+		}
+		if _, ok := hs.trees[p.Cwd]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // authorComplete reports whether a host's scan answers the author route's two

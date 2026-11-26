@@ -221,3 +221,37 @@ func TestBoundLaneStandsWhenBudgetCutsAgentLoop(t *testing.T) {
 		t.Fatalf("route lane %q unknown %v finished %q; want bound lane w-7-lane, unknown, not finished", rt.lane, rt.unknown, rt.finished)
 	}
 }
+
+// An agent cwd whose inspect fails with a tolerated, non-timeout error leaves
+// the host without that tree: the host is not complete, so the terminal job is
+// unknown, and the bound lane stands.
+func TestBoundLaneStandsWhenAgentInspectErrorIsTolerated(t *testing.T) {
+	errPane := aPane{"w1:p8", "w-5", "/wt/err", "other", projectOrigin}
+	s, sink, run := takeoverSetup(t, errPane)
+	run.errs = map[string]error{key("git", "-C", "/wt/err", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"): errors.New("signal: terminated")}
+	sink.recs["w-7"] = integrations.JobRecord{State: "completed", Role: "worker", Label: "w-7", HubLane: "w-7-lane"}
+	rt, e := s.findingsRoute(context.Background(), testRepoFor(s), s.GH.(*fakeGH).pull)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if rt.lane != "w-7-lane" || !rt.unknown || rt.finished != "" {
+		t.Fatalf("route lane %q unknown %v finished %q; want bound lane w-7-lane, unknown, not finished", rt.lane, rt.unknown, rt.finished)
+	}
+}
+
+// The same tolerated inspect error, with a later head-branch candidate on that
+// host: the candidate is not judged, so there is no takeover and no lane is
+// cleared.
+func TestBoundLaneNoTakeoverAfterTolerated(t *testing.T) {
+	errPane := aPane{"w1:p8", "w-5", "/wt/err", "other", projectOrigin}
+	s, sink, run := takeoverSetup(t, errPane, paneB)
+	run.errs = map[string]error{key("git", "-C", "/wt/err", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"): errors.New("signal: terminated")}
+	sink.recs["w-7"] = integrations.JobRecord{State: "completed", Role: "worker", Label: "w-7", HubLane: "w-7-lane"}
+	rt, e := s.findingsRoute(context.Background(), testRepoFor(s), s.GH.(*fakeGH).pull)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if rt.lane != "w-7-lane" || !rt.unknown || rt.finished != "" {
+		t.Fatalf("route lane %q unknown %v finished %q; want bound lane w-7-lane, unknown, not finished", rt.lane, rt.unknown, rt.finished)
+	}
+}
