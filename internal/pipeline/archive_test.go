@@ -263,6 +263,124 @@ func TestArchiveJobsPaneScanFailureIsUnscannedWithoutFailingRun(t *testing.T) {
 	}
 }
 
+func TestArchiveJobsDropsConfiguredOldJobWithoutHK(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	dir := jobDir(t, f.jobs, "reviewer-old", 20*24*time.Hour)
+	f.s.Config.Reap.Archive.Drop = []config.ArchiveDrop{{Host: "local", Glob: "reviewer-*"}}
+	f.s.Config.Reap.Archive.MinAge = "1h"
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("drop dir remains: %v", err)
+	}
+	if f.hkCalls() != 0 {
+		t.Fatalf("drop made %d hk calls", f.hkCalls())
+	}
+	b, err := os.ReadFile(filepath.Join(f.s.Config.StateDir, "archive-jobs.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"result":"dropped"`) || !strings.Contains(string(b), `"files":5`) {
+		t.Fatalf("missing dropped receipt: %s", b)
+	}
+}
+
+func TestArchiveJobsDropDryRunKeepsJob(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	dir := jobDir(t, f.jobs, "reviewer-old", 20*24*time.Hour)
+	f.s.Config.Reap.Archive.Drop = []config.ArchiveDrop{{Host: "local", Glob: "reviewer-*"}}
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{DryRun: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("dry run deleted job: %v", err)
+	}
+	if !strings.Contains(f.out.String(), `"result":"would-drop"`) {
+		t.Fatalf("missing would-drop: %s", f.out.String())
+	}
+}
+
+func TestArchiveJobsDropAgeGateAfterRefresh(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	dir := jobDir(t, f.jobs, "reviewer-old", 20*24*time.Hour)
+	f.s.Config.Reap.Archive.Drop = []config.ArchiveDrop{{Host: "local", Glob: "reviewer-*"}}
+	f.s.Runner = &archiveDropUncertainRunner{base: f.run, dir: dir}
+	if err := f.s.ArchiveJobs(context.Background(), "", 24*time.Hour, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("fresh job was dropped: %v", err)
+	}
+	if !strings.Contains(f.out.String(), `"reason":"too-new"`) {
+		t.Fatalf("missing too-new row: %s", f.out.String())
+	}
+}
+
+type archiveDropUncertainRunner struct {
+	base integrations.Runner
+	dir  string
+	once sync.Once
+}
+
+func (r *archiveDropUncertainRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
+	if name == "sh" && len(args) > 1 && strings.Contains(args[1], "for d in *; do") {
+		r.once.Do(func() { _ = os.WriteFile(filepath.Join(r.dir, "recent.txt"), []byte("new"), 0o644) })
+		// Make only the host-list mtime scan uncertain while keeping the
+		// following DropInfo listing operational.
+		if strings.Contains(args[1], "newestSummary=$({ find") {
+			args = append([]string(nil), args...)
+			args[1] = strings.Replace(args[1], `find "$d" ! -type d`, "find /path-that-does-not-exist", 1)
+		}
+	}
+	return r.base.Run(ctx, name, args, input, dir)
+}
+
+func TestArchiveJobsDropCapDoesNotFallThrough(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	jobDir(t, f.jobs, "reviewer-a", 20*24*time.Hour)
+	jobDir(t, f.jobs, "reviewer-b", 20*24*time.Hour)
+	f.s.Config.Reap.Archive.Drop = []config.ArchiveDrop{{Host: "local", Glob: "reviewer-*"}}
+	f.s.Config.Reap.Archive.MaxDropsPerRun = 1
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{DryRun: true}); err != nil {
+		t.Fatal(err)
+	}
+	out := f.out.String()
+	if strings.Contains(out, `"result":""`) || !strings.Contains(out, `"eligible_left":1`) {
+		t.Fatalf("invalid cap result: %s", out)
+	}
+	if strings.Contains(out, `"result":"would-archive"`) {
+		t.Fatalf("capped drop fell through to archive: %s", out)
+	}
+}
+
+func TestArchiveJobsDropSummaryCounts(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	jobDir(t, f.jobs, "reviewer-old", 20*24*time.Hour)
+	f.s.Config.Reap.Archive.Drop = []config.ArchiveDrop{{Host: "local", Glob: "reviewer-*"}}
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{DryRun: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(f.out.String(), `"would_drop":1`) {
+		t.Fatalf("summary omits would_drop: %s", f.out.String())
+	}
+}
+
+func TestArchiveJobsDropBudgetDeadline(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	jobDir(t, f.jobs, "reviewer-old", 20*24*time.Hour)
+	f.s.Config.Reap.Archive.Drop = []config.ArchiveDrop{{Host: "local", Glob: "reviewer-*"}}
+	f.s.Config.Reap.Archive.MaxRun = "2s"
+	f.s.Runner = archiveBlockRunner{base: f.run, match: "find \"$1\" -name .git"}
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{}); err != nil {
+		t.Fatalf("budget stop returned error: %v", err)
+	}
+	out := f.out.String()
+	if !strings.Contains(out, `"stopped_on_budget":true`) || !strings.Contains(out, `"eligible_left":1`) {
+		t.Fatalf("missing budget accounting: %s", out)
+	}
+}
+
 func TestArchiveJobsBlockingPaneScanStopsAtMaxRunWithSummary(t *testing.T) {
 	f := newArchiveFixture(t, noAgents)
 	f.s.Config.Reap.Archive.MaxRun = "50ms"
@@ -1596,7 +1714,7 @@ func TestArchiveJobsBacklog(t *testing.T) {
 	}
 }
 
-func TestArchiveJobsDeletesUnsafeNestedCheckout(t *testing.T) {
+func TestArchiveJobsRecordsUnsafeCheckoutAsRetained(t *testing.T) {
 	f := newArchiveFixture(t, noAgents)
 	dir := jobDir(t, f.jobs, "unsafe-checkout", 20*24*time.Hour)
 	if err := os.RemoveAll(filepath.Join(dir, "events")); err != nil {
@@ -1608,15 +1726,15 @@ func TestArchiveJobsDeletesUnsafeNestedCheckout(t *testing.T) {
 	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		t.Fatalf("unsafe source remains: %v", err)
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("unsafe source was removed: %v", err)
 	}
 	log, err := os.ReadFile(filepath.Join(f.s.Config.StateDir, "archive-jobs.jsonl"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(log), `"result":"archived"`) || !strings.Contains(string(log), `"deleted":true`) {
-		t.Fatalf("archive completion row missing: %s", log)
+	if !strings.Contains(string(log), `"result":"archived-retained"`) || !strings.Contains(string(log), `retained: checkout-unsafe wt git-error`) {
+		t.Fatalf("retention row missing: %s", log)
 	}
 }
 
@@ -1790,8 +1908,9 @@ func TestReapArchiveErrorCountedOnce(t *testing.T) {
 	}
 }
 
-// An unsafe nested checkout is archived and deleted after the sighting ages.
-func TestReapArchiveUnsafeNestedCheckoutDeleted(t *testing.T) {
+// A retained archive is re-attempted after the hour, and each attempt is
+// recorded: the retry row is appended even though the outcome repeats.
+func TestReapArchiveRetainedRetryAppendsRow(t *testing.T) {
 	f := newArchiveFixture(t, noAgents)
 	dir := jobDir(t, f.jobs, "wk-7", 48*time.Hour)
 	if err := os.RemoveAll(filepath.Join(dir, "events")); err != nil {
@@ -1807,23 +1926,24 @@ func TestReapArchiveUnsafeNestedCheckoutDeleted(t *testing.T) {
 	if rows := f.rows(t); len(rows) != 1 || rows[0].Reason != "awaiting-min-age" {
 		t.Fatalf("rows = %+v", rows)
 	}
-	// Once the sighting ages out the archive runs and deletes the source.
+	// Once the sighting ages out the archive runs and is retained.
 	f.s.Now = func() time.Time { return time.Now().Add(48 * time.Hour) }
 	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if rows := f.rows(t); len(rows) != 2 || rows[1].Result != "archived" {
+	if rows := f.rows(t); len(rows) != 2 || rows[1].Result != "archived-retained" {
 		t.Fatalf("rows = %+v", rows)
 	}
-	if _, err := os.Stat(dir); !os.IsNotExist(err) {
-		t.Fatalf("unsafe source remains: %v", err)
-	}
+	// Past the retry hour the attempt is recorded again, not deduped away.
 	f.s.Now = func() time.Time { return time.Now().Add(50 * time.Hour) }
 	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if rows := f.rows(t); len(rows) != 2 {
-		t.Fatalf("deleted job was reconsidered: %+v", rows)
+	if rows := f.rows(t); len(rows) != 3 || rows[2].Result != "archived-retained" {
+		t.Fatalf("retry did not re-attempt the archive: %+v", rows)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatal("retained source removed")
 	}
 }
 

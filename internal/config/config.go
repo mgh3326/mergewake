@@ -802,19 +802,23 @@ type Archive struct {
 	DriveDir string `yaml:"drive_dir"`
 	// ArchiveHost is an ssh destination reachable from this machine; empty or
 	// "local" means the Drive folder is on this machine.
-	ArchiveHost       string   `yaml:"archive_host"`
-	TextMaxBytes      int64    `yaml:"text_max_bytes"`
-	DriveMaxFileBytes int64    `yaml:"drive_max_file_bytes"`
-	MinAge            string   `yaml:"min_age"`
-	MaxJobsPerRun     int      `yaml:"max_jobs_per_run"`
-	MaxRun            string   `yaml:"max_run"`
-	Exclude           []string `yaml:"exclude"`
-	CachePaths        []string `yaml:"cache_paths"`
+	ArchiveHost       string        `yaml:"archive_host"`
+	TextMaxBytes      int64         `yaml:"text_max_bytes"`
+	DriveMaxFileBytes int64         `yaml:"drive_max_file_bytes"`
+	MinAge            string        `yaml:"min_age"`
+	MaxJobsPerRun     int           `yaml:"max_jobs_per_run"`
+	MaxRun            string        `yaml:"max_run"`
+	Exclude           []string      `yaml:"exclude"`
+	Drop              []ArchiveDrop `yaml:"drop"`
+	MaxDropsPerRun    int           `yaml:"max_drops_per_run"`
+}
+
+type ArchiveDrop struct {
+	Host string `yaml:"host"`
+	Glob string `yaml:"glob"`
 }
 
 var DefaultArchiveExclude = []string{"pw-rollout-*", "pw-hk*", "events-lane"}
-
-var DefaultArchiveCachePaths = []string{"pkg/mod/", "go-build/", ".gocache/", "gocache/", "node_modules/", ".npm/", ".pnpm-store/", ".yarn/cache/", "__pycache__/", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/", ".tox/", ".venv/", ".cache/", ".gradle/caches/", ".m2/repository/", ".cargo/registry/", ".cargo/git/", "Library/Caches/"}
 
 // ArchiveTextCap bounds reap.archive.text_max_bytes below the runner's 4 MiB
 // output limit, since each text file is read back through it.
@@ -1687,15 +1691,15 @@ func validateArchive(a *Archive) error {
 			return fmt.Errorf("reap.archive.exclude: invalid glob %q: %w", pattern, err)
 		}
 	}
-	if a.CachePaths == nil {
-		a.CachePaths = append([]string(nil), DefaultArchiveCachePaths...)
+	if a.MaxDropsPerRun < 0 {
+		return errors.New("reap.archive.max_drops_per_run must be non-negative")
 	}
-	if len(a.CachePaths) > 64 {
-		return errors.New("reap.archive.cache_paths holds more than 64 paths")
-	}
-	for _, p := range a.CachePaths {
-		if !validArchiveCachePath(p) {
-			return fmt.Errorf("reap.archive.cache_paths: invalid path %q", p)
+	for _, rule := range a.Drop {
+		if rule.Host == "" || rule.Glob == "" {
+			return errors.New("reap.archive.drop entries require host and glob")
+		}
+		if _, err := path.Match(rule.Glob, ""); err != nil {
+			return fmt.Errorf("reap.archive.drop: invalid glob %q: %w", rule.Glob, err)
 		}
 	}
 	if a.DriveMaxFileBytes < 0 {
@@ -1726,18 +1730,6 @@ func validateArchive(a *Archive) error {
 		return errors.New("reap.archive.drive_dir must be an absolute path; ~ expands only for a local archive host")
 	}
 	return nil
-}
-
-func validArchiveCachePath(p string) bool {
-	if p == "" || len(p) > 4096 || strings.HasPrefix(p, "/") || strings.HasPrefix(p, "-") || !strings.HasSuffix(p, "/") || strings.ContainsAny(p, "\\\x00\r\n*?[]") {
-		return false
-	}
-	for _, segment := range strings.Split(strings.TrimSuffix(p, "/"), "/") {
-		if segment == "" || segment == "." || segment == ".." {
-			return false
-		}
-	}
-	return true
 }
 
 // laneName and hostName bound the panewire lane and panewire host names
