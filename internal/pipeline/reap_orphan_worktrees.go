@@ -68,7 +68,10 @@ func (s *Service) reapOrphanWorktrees(ctx context.Context, r config.Repo, hosts 
 	limit := s.Config.Reap.OrphanWorktrees.PerHostOrDefault()
 	from, cursorErr := s.orphanWorktreeCursor(r.Name)
 	if cursorErr != nil {
-		return []error{fmt.Errorf("orphan worktrees resume cursor: %w", cursorErr)}
+		// A stale or damaged cursor must not make the stage permanently fail.
+		// Report it and start this pass without resume state.
+		note(reapReceipt{Action: orphanWorktreeAction, Repo: r.Name, Result: "error", Reason: fmt.Sprintf("orphan worktrees resume cursor: %v", cursorErr)})
+		from = orphanWorktreeCursor{}
 	}
 	owned, err := s.orphanReviewerPaths()
 	if err != nil {
@@ -187,9 +190,6 @@ func (s *Service) reapOrphanWorktrees(ctx context.Context, r config.Repo, hosts 
 		// Resume this host independently, then inspect its candidates before
 		// spending the remaining budget discovering another host.
 		cursor := orphanWorktreeCursor{Host: hs.host.Name, Path: from.Hosts[hs.host.Name]}
-		if from.Hosts == nil && from.Host == hs.host.Name {
-			cursor.Path = from.Path
-		}
 		visits = resumeOrphanWorktreeVisits(visits, cursor)
 		for _, visit := range visits {
 			hs, entry := visit.hs, visit.entry
@@ -207,7 +207,6 @@ func (s *Service) reapOrphanWorktrees(ctx context.Context, r config.Repo, hosts 
 				budgetStopped = true
 				break
 			}
-			visited[visit.host]++
 			lastVisited[visit.host] = entry.Path
 			kind := orphanWorktreeKind(entry)
 			rec := reapReceipt{Action: orphanWorktreeAction, Repo: r.Name, Host: hs.host.Name, Worktree: entry.Path, Branch: entry.Branch, Kind: kind}
@@ -224,6 +223,7 @@ func (s *Service) reapOrphanWorktrees(ctx context.Context, r config.Repo, hosts 
 				keep("worker-owned")
 				continue
 			}
+			visited[visit.host]++
 			if hs.viaHub {
 				// Current node worktree.list exposes status summaries, but not the
 				// required no-lock status paths, filesystem mtimes, or fetch-free

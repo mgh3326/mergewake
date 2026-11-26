@@ -396,7 +396,7 @@ Before a worktree is planned or removed, the pass requires all four checks:
 
 Unknown evidence keeps the worktree with a reason. Each considered path writes
 an `orphan-worktree` row with `would-remove` or `kept`; the `kind` is `exp`,
-`detached`, `branch`, `wk-no-pr`, or `other`. The CLI also prints counts by
+`detached`, `branch`, `worker-owned`, or `other`. The CLI also prints counts by
 host and kind for routing-policy review before `act` is enabled. On panewire
 hosts the current `worktree.list` response does not provide the no-lock status
 paths, filesystem mtimes, or upstream refs needed for these checks, so those
