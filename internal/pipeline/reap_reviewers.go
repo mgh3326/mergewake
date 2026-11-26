@@ -170,7 +170,8 @@ const (
 	// reviewerLegacyProbeHold bounds the extra refresh and inspect used to
 	// check the pre-suffix worktree layout for an already-gone label.
 	reviewerLegacyProbeHold = "legacy path probe cap reached for this host; the next pass continues"
-	reviewerHostProbeHold   = "host checkout probe cap reached for this host; the next pass continues"
+	reviewerHostProbeHold   = "host checkout probe cap reached at %s; the next pass continues"
+	reviewerHostDiscovered  = "host discovery resolved; cleanup is tracked on the host stream"
 	// reviewerLegacyProbesPerHost bounds the remote fallback probes independently
 	// of guarded removals. The old-path backlog must not monopolize a pass.
 	reviewerLegacyProbesPerHost = 5
@@ -194,7 +195,7 @@ func reviewerTerminal(v reapReceipt) bool {
 	case "closed", "removed":
 		return true
 	case "skipped":
-		return strings.Contains(v.Reason, "already gone") || strings.HasPrefix(v.Reason, reviewerOtherRepo)
+		return strings.Contains(v.Reason, "already gone") || strings.HasPrefix(v.Reason, reviewerOtherRepo) || v.Reason == reviewerHostDiscovered
 	case "kept":
 		return v.Worktree != "" && (v.Reason == reviewerHostUnknown || strings.HasPrefix(v.Reason, reviewerRefused))
 	}
@@ -241,7 +242,6 @@ func reviewerLabelOf(v reapReceipt) string {
 
 type reviewerSweep struct {
 	s          *Service
-	ctx        context.Context
 	r          config.Repo
 	hosts      []*reapHost
 	acting     bool
@@ -335,7 +335,7 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 	if e != nil {
 		return []error{fmt.Errorf("reviewer reap: review.panewire.stuck_after: %w", e)}
 	}
-	w := &reviewerSweep{s: s, ctx: ctx, r: r, hosts: hosts, acting: acting, now: s.now(), settle: d + time.Minute, stuckAfter: stuckAfter, note: note, streams: map[string]map[string]reapReceipt{}, remote: map[string]map[string]string{}, abandoned: map[string]bool{}, stuck: map[string]bool{}, pulls: map[int]github.Pull{}, audits: map[string]reviewerAudit{}, auditOnly: map[string]bool{}, rowed: map[string]bool{}, resumable: prNum == 0 && durable}
+	w := &reviewerSweep{s: s, r: r, hosts: hosts, acting: acting, now: s.now(), settle: d + time.Minute, stuckAfter: stuckAfter, note: note, streams: map[string]map[string]reapReceipt{}, remote: map[string]map[string]string{}, abandoned: map[string]bool{}, stuck: map[string]bool{}, pulls: map[int]github.Pull{}, audits: map[string]reviewerAudit{}, auditOnly: map[string]bool{}, rowed: map[string]bool{}, resumable: prNum == 0 && durable}
 	if jobs, ok := s.Sink.(reapJobs); ok {
 		w.jobs = reapTimedJobs{base: jobs, telemetry: telemetryFrom(ctx)}
 	}
@@ -1635,7 +1635,8 @@ func (w *reviewerSweep) removeUnrecorded(ctx context.Context, l reviewerLabel, c
 	} else {
 		// No record, receipt or audit row names a host, so no remote path can
 		// be built. Search the configured work roots before settling it.
-		if hs, uncertain, capped := w.findUnrecordedCheckout(l); hs != nil {
+		if hs, uncertain, capped := w.findUnrecordedCheckout(ctx, l); hs != nil {
+			w.settleHostlessStream(l)
 			if w.removeRemote(ctx, hs, l, "") == remoteStop {
 				return
 			}
@@ -1643,12 +1644,10 @@ func (w *reviewerSweep) removeUnrecorded(ctx context.Context, l reviewerLabel, c
 			rec := w.row(l)
 			rec.Worktree = l.name
 			if capped != "" {
-				rec.Host, rec.Cwd = capped, reviewerWorktreePath(w.scannedHost(capped), l)
-				w.record(rec, "pending-cleanup", reviewerHostProbeHold)
+				w.record(rec, "pending-cleanup", fmt.Sprintf(reviewerHostProbeHold, capped))
 			} else {
 				w.record(rec, "pending-cleanup", "host checkout probe unavailable")
 			}
-			return
 		} else {
 			rec := w.row(l)
 			rec.Host, rec.Worktree = c.host, l.name
@@ -1662,10 +1661,23 @@ func (w *reviewerSweep) removeUnrecorded(ctx context.Context, l reviewerLabel, c
 	w.removeLocal(ctx, l)
 }
 
+// settleHostlessStream closes a prior discovery placeholder once a unique
+// host is known. The concrete host stream then owns the remaining cleanup.
+func (w *reviewerSweep) settleHostlessStream(l reviewerLabel) {
+	rec := w.row(l)
+	rec.Worktree = l.name
+	key := reviewerStream(rec)
+	prior, ok := w.streams[l.name][key]
+	if !ok || reviewerTerminal(prior) {
+		return
+	}
+	w.record(rec, "skipped", reviewerHostDiscovered)
+}
+
 // findUnrecordedCheckout probes the spec checkout path on hosts without a
 // work root or failed scan left the result uncertain. The shared probe budget
 // never spends a guarded-removal slot; dry runs do no remote inspection.
-func (w *reviewerSweep) findUnrecordedCheckout(l reviewerLabel) (*reapHost, bool, string) {
+func (w *reviewerSweep) findUnrecordedCheckout(ctx context.Context, l reviewerLabel) (*reapHost, bool, string) {
 	if !w.acting {
 		return nil, false, ""
 	}
@@ -1692,7 +1704,7 @@ func (w *reviewerSweep) findUnrecordedCheckout(l reviewerLabel) (*reapHost, bool
 			}
 			continue
 		}
-		tree, err := hs.ops.Inspect(w.ctx, path)
+		tree, err := hs.ops.Inspect(ctx, path)
 		if err != nil {
 			if isHostUnreachable(err) {
 				hs.failed = true
