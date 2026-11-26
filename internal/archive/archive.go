@@ -118,6 +118,7 @@ type Archiver struct {
 	DriveDir          string
 	SSH               string
 	Exclude           []string
+	CachePaths        []string
 	TextMax           int64
 	DriveMaxFileBytes int64
 }
@@ -186,6 +187,7 @@ type Exclusion struct {
 	Path   string `json:"path"`
 	Reason string `json:"reason"`
 	Files  int    `json:"files,omitempty"`
+	State  string `json:"state,omitempty"`
 }
 
 type Retention struct {
@@ -241,6 +243,34 @@ func Credential(p string) bool {
 		}
 	}
 	return false
+}
+
+func cacheRoot(file string, roots []string) (string, bool) {
+	segs := strings.Split(file, "/")
+	for _, root := range roots {
+		rootSegs := strings.Split(strings.TrimSuffix(root, "/"), "/")
+		if root == "" || len(rootSegs) == 0 {
+			continue
+		}
+		for i := 0; i+len(rootSegs) <= len(segs); i++ {
+			matches := true
+			for j := range rootSegs {
+				if segs[i+j] != rootSegs[j] {
+					matches = false
+					break
+				}
+			}
+			if matches {
+				return strings.Join(segs[:i+len(rootSegs)], "/"), true
+			}
+		}
+	}
+	return "", false
+}
+
+func isCachePath(file string, roots []string) bool {
+	_, ok := cacheRoot(file, roots)
+	return ok
 }
 
 // text names the job files stored in hk: markdown and JSON (brief, report,
@@ -748,6 +778,16 @@ func (a *Archiver) planListed(ctx context.Context, h reap.Host, job, dir string,
 	}
 	sort.Strings(p.checkouts)
 	sort.Slice(p.ExcludedEntries, func(i, j int) bool { return p.ExcludedEntries[i].Path < p.ExcludedEntries[j].Path })
+	cacheCounts := map[string]int{}
+	for _, f := range files {
+		if root, ok := cacheRoot(f.Path, a.CachePaths); ok && f.kind == 'f' {
+			cacheCounts[root]++
+		}
+	}
+	for root, count := range cacheCounts {
+		p.ExcludedEntries = append(p.ExcludedEntries, Exclusion{Path: root, Reason: "cache", Files: count})
+	}
+	sort.Slice(p.ExcludedEntries, func(i, j int) bool { return p.ExcludedEntries[i].Path < p.ExcludedEntries[j].Path })
 	for _, f := range files {
 		if f.mtime > p.Newest {
 			p.Newest = f.mtime
@@ -776,6 +816,8 @@ func (a *Archiver) planListed(ctx context.Context, h reap.Host, job, dir string,
 			// The archive's own manifest goes there; never overwrite one.
 			return nil, &Skip{"manifest-collision"}
 		case inCheckout(f.Path, checkouts):
+			continue
+		case isCachePath(f.Path, a.CachePaths):
 			continue
 		case Credential(f.Path):
 			d.reason = "credential-path"
@@ -1366,10 +1408,10 @@ func (a *Archiver) publish(ctx context.Context, p *Plan, m *manifest, addComment
 		if x.Files > 0 {
 			fmt.Fprintf(&summary, " files=%d", x.Files)
 		}
+		if x.State != "" {
+			fmt.Fprintf(&summary, " state=%s", x.State)
+		}
 		summary.WriteByte('\n')
-	}
-	for _, x := range m.Retained {
-		fmt.Fprintf(&summary, "retained: checkout-unsafe %s %s\n", x.Path, x.Reason)
 	}
 	key := "archive/" + p.Task + "/" + p.Job
 	if p.Task == "" {
@@ -1494,9 +1536,16 @@ func (a *Archiver) Apply(ctx context.Context, p *Plan, now time.Time) (*Result, 
 		m.TotalBytes += f.Size
 	}
 
-	m.Retained, err = a.checkoutSafety(ctx, p)
+	checkoutStates, err := a.checkoutSafety(ctx, p)
 	if err != nil {
 		return nil, err
+	}
+	for _, state := range checkoutStates {
+		for i := range m.ExcludedEntries {
+			if m.ExcludedEntries[i].Path == state.Path && m.ExcludedEntries[i].Reason == "git-tracked" {
+				m.ExcludedEntries[i].State = state.Reason
+			}
+		}
 	}
 	manifestSHA, err := a.publish(ctx, p, &m, true)
 	if err != nil {
@@ -1589,22 +1638,6 @@ func (a *Archiver) remove(ctx context.Context, p *Plan, res *Result, m *manifest
 	}
 	if !sameOutsideCheckouts(again, p.entries, p.checkouts) {
 		return res, &Skip{"job-changed"}
-	}
-	retained, err := a.checkoutSafety(ctx, p)
-	if err != nil {
-		return res, err
-	}
-	if !sameRetained(retained, m.Retained) {
-		m.Retained = retained
-		sum, err := a.publish(ctx, p, m, false)
-		if err != nil {
-			return res, err
-		}
-		res.Manifest = sum
-		res.Retained = retained
-	}
-	if len(retained) != 0 {
-		return res, nil
 	}
 	// p.Dir is absolute (Jobs), so it can never be read as an rm option and
 	// no "--" is needed.
