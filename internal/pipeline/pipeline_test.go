@@ -610,6 +610,23 @@ type noMergeGitRunner struct {
 	}
 }
 
+// panewireNoMergeGitRunner keeps gate history synthetic but forwards fetches
+// so panewire fixtures can record or fail the PR-head fetch as configured.
+type panewireNoMergeGitRunner struct{ noMergeGitRunner }
+
+func (r panewireNoMergeGitRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	if command == "git" {
+		gitArgs := args
+		if len(gitArgs) >= 2 && gitArgs[0] == "-C" {
+			gitArgs = gitArgs[2:]
+		}
+		if len(gitArgs) > 0 && gitArgs[0] == "fetch" {
+			return r.next.Run(ctx, command, args, input, dir)
+		}
+	}
+	return r.noMergeGitRunner.Run(ctx, command, args, input, dir)
+}
+
 func (r noMergeGitRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
 	if command == "git" {
 		gitArgs := args

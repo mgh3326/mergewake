@@ -63,6 +63,9 @@ type Service struct {
 	// patches caches each PR head's patch id (see patchIDOf), guarded by
 	// patchMu.
 	patches map[string]string
+	// baseDrops caches successful base-drop verdicts by base/head and
+	// merge-base/head, guarded by its keyed path lock.
+	baseDrops map[string]baseDropResult
 	// ancestorOnBase and cleanMerged cache the base-merge checks of base_merge.go
 	// that came back true (see baseMergeMu).
 	ancestorOnBase, cleanMerged map[string]bool

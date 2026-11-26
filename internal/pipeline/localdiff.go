@@ -119,14 +119,20 @@ func (s *Service) localDiff(ctx context.Context, r config.Repo, pr github.Pull) 
 	return diffResult{text: text, source: "local", summarized: summarized}, nil
 }
 
-// baseChangesDropped checks only commits brought in by first-parent merges on
-// the PR branch. A commit counts when it added a line that survived to the
-// current merge base but not to the PR head. The work is bounded so an unusual
-// history fails closed instead of making the gate unbounded.
+// baseChangesDropped checks each first-parent merge's own result. A base commit
+// counts when it added a line present in that merge's second parent but absent
+// from the merge tree. Later PR commits do not affect the attribution. The
+// verdict is cached for an unchanged base/head pair.
 func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr github.Pull) ([]string, error) {
 	root := config.Expand(r.Root)
 	if root == "" || s.Runner == nil || pr.Head.SHA == "" || pr.Base.SHA == "" {
 		return nil, errors.New("base-drop check lacks checkout, runner, or PR commits")
+	}
+	unlock := lockPath(fmt.Sprintf("base-drop:%p", s))
+	defer unlock()
+	inputKey := baseDropCacheKey("pair", pr.Base.SHA, pr.Head.SHA)
+	if cached, ok := s.baseDrops[inputKey]; ok {
+		return slices.Clone(cached.commits), nil
 	}
 	git := func(args ...string) (string, error) {
 		b, err := s.gitIn(ctx, root, args...)
@@ -162,6 +168,11 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 	if err != nil || mergeBase == "" {
 		return nil, errors.New("base and head have no merge base")
 	}
+	mergeKey := baseDropCacheKey("merge", mergeBase, pr.Head.SHA)
+	if cached, ok := s.baseDrops[mergeKey]; ok {
+		s.cacheBaseDrop(inputKey, mergeKey, cached)
+		return slices.Clone(cached.commits), nil
+	}
 	mergesText, err := field("rev-list", "--first-parent", "--merges", mergeBase+".."+pr.Head.SHA)
 	if err != nil {
 		return nil, fmt.Errorf("list PR merges: %w", err)
@@ -173,6 +184,7 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 	affected := map[string]bool{}
 	commitsSeen := map[string]bool{}
 	lineCount := 0
+	fileCache := map[string]map[string]map[string]struct{}{}
 	for _, merge := range merges {
 		parentsText, err := field("rev-list", "--parents", "-n", "1", merge)
 		if err != nil {
@@ -189,6 +201,11 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 		if baseAncestor != parents[2] {
 			continue
 		}
+		renamesText, err := field("diff-tree", "--find-renames", "--no-commit-id", "--name-status", "-z", "-r", parents[2], merge)
+		if err != nil {
+			return nil, fmt.Errorf("read merge renames for %s: %w", merge, err)
+		}
+		renames := renamedPaths(renamesText)
 		forkPoint, err := field("merge-base", parents[1], parents[2])
 		if err != nil || forkPoint == "" {
 			return nil, fmt.Errorf("find fork point for merge %s", merge)
@@ -226,18 +243,22 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 				if lineCount > baseDropLineLimit {
 					return nil, fmt.Errorf("base history exceeds %d added lines", baseDropLineLimit)
 				}
-				atBase, err := fileHasLine(git, mergeBase, line.path, line.text)
+				atSecondParent, err := fileHasLineCached(git, parents[2], line.path, line.text, fileCache)
 				if err != nil {
-					return nil, fmt.Errorf("read merge-base file %s: %w", line.path, err)
+					return nil, fmt.Errorf("read second-parent file %s: %w", line.path, err)
 				}
-				if !atBase {
+				if !atSecondParent {
 					continue
 				}
-				atHead, err := fileHasLine(git, pr.Head.SHA, line.path, line.text)
-				if err != nil {
-					return nil, fmt.Errorf("read PR file %s: %w", line.path, err)
+				mergePath := line.path
+				if renamed, ok := renames[line.path]; ok {
+					mergePath = renamed
 				}
-				if !atHead {
+				inMerge, err := fileHasLineCached(git, merge, mergePath, line.text, fileCache)
+				if err != nil {
+					return nil, fmt.Errorf("read merge file %s: %w", mergePath, err)
+				}
+				if !inMerge {
 					affected[commit] = true
 				}
 			}
@@ -248,7 +269,24 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 		dropped = append(dropped, commit)
 	}
 	slices.Sort(dropped)
+	result := baseDropResult{mergeBase: mergeBase, commits: slices.Clone(dropped)}
+	s.cacheBaseDrop(inputKey, mergeKey, result)
 	return dropped, nil
+}
+
+type baseDropResult struct {
+	mergeBase string
+	commits   []string
+}
+
+func baseDropCacheKey(kind, base, head string) string { return kind + "\x00" + base + "\x00" + head }
+
+func (s *Service) cacheBaseDrop(inputKey, mergeKey string, result baseDropResult) {
+	if s.baseDrops == nil {
+		s.baseDrops = make(map[string]baseDropResult)
+	}
+	s.baseDrops[inputKey] = result
+	s.baseDrops[mergeKey] = result
 }
 
 const (
@@ -284,26 +322,63 @@ func addedFileLines(diff string) []addedBaseLine {
 	return result
 }
 
-func fileHasLine(git func(...string) (string, error), revision, path, want string) (bool, error) {
+func renamedPaths(status string) map[string]string {
+	fields := strings.Split(status, "\x00")
+	result := map[string]string{}
+	for i := 0; i < len(fields); {
+		kind := fields[i]
+		i++
+		if kind == "" {
+			continue
+		}
+		if strings.HasPrefix(kind, "R") && i+1 < len(fields) {
+			result[fields[i]] = fields[i+1]
+			i += 2
+		} else if i < len(fields) {
+			i++
+		}
+	}
+	return result
+}
+
+func fileHasLineCached(git func(...string) (string, error), revision, path, want string, cache map[string]map[string]map[string]struct{}) (bool, error) {
+	byPath := cache[revision]
+	if byPath == nil {
+		byPath = map[string]map[string]struct{}{}
+		cache[revision] = byPath
+	}
+	lines, ok := byPath[path]
+	if !ok {
+		var err error
+		lines, err = fileLineSet(git, revision, path)
+		if err != nil {
+			return false, err
+		}
+		byPath[path] = lines
+	}
+	_, ok = lines[want]
+	return ok, nil
+}
+
+func fileLineSet(git func(...string) (string, error), revision, path string) (map[string]struct{}, error) {
 	text, err := git("show", revision+":"+path)
 	if err != nil {
 		// A missing path means the line is absent. Check the tree separately so
 		// a missing blob or other object error fails closed.
 		tree, treeErr := git("ls-tree", "-r", "--name-only", revision)
 		if treeErr != nil {
-			return false, treeErr
+			return nil, treeErr
 		}
 		if !slices.Contains(strings.Split(strings.TrimSpace(tree), "\n"), path) {
-			return false, nil
+			return map[string]struct{}{}, nil
 		}
-		return false, err
+		return nil, err
 	}
+	lines := make(map[string]struct{})
 	for _, line := range strings.Split(text, "\n") {
-		if line == want {
-			return true, nil
-		}
+		lines[line] = struct{}{}
 	}
-	return false, nil
+	return lines, nil
 }
 
 // boundDiff applies reviewDiffBudget to a GitHub API patch. A patch within the

@@ -40,19 +40,64 @@ func baseDropRepo(t *testing.T, mode string) (root, base, head string) {
 			t.Fatal(err)
 		}
 	}
-	write("legacy line\n")
+	baseText := "legacy line\n"
+	if mode == "combine" {
+		baseText = "target line\n"
+	}
+	write(baseText)
 	baseDropGit(t, src, "add", ".")
 	baseDropGit(t, src, "commit", "-m", "fork point")
 	fork := baseDropGit(t, src, "rev-parse", "HEAD")
-	write("legacy line\nbase addition\n")
+	if mode == "combine" {
+		write("base side\n")
+	} else {
+		write("legacy line\nbase addition\n")
+	}
 	baseDropGit(t, src, "commit", "-am", "base adds line")
 	base = baseDropGit(t, src, "rev-parse", "HEAD")
 	baseDropGit(t, src, "switch", "-c", "feature", fork)
 	switch mode {
 	case "drop":
-		baseDropGit(t, src, "merge", "-s", "ours", "main", "-m", "drop base addition")
+		baseDropGit(t, src, "merge", "--no-ff", "-s", "ours", "main", "-m", "drop base addition")
 	case "both":
+		if err := os.WriteFile(filepath.Join(src, "feature.txt"), []byte("feature work\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		baseDropGit(t, src, "add", "feature.txt")
+		baseDropGit(t, src, "commit", "-m", "feature work")
 		baseDropGit(t, src, "merge", "main", "-m", "keep both sides")
+		parents := strings.Fields(baseDropGit(t, src, "rev-list", "--parents", "-n", "1", "HEAD"))
+		if len(parents) != 3 {
+			t.Fatalf("keep-both fixture did not create a merge commit: %v", parents)
+		}
+	case "edit_after_merge":
+		if err := os.WriteFile(filepath.Join(src, "feature.txt"), []byte("feature work\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		baseDropGit(t, src, "add", "feature.txt")
+		baseDropGit(t, src, "commit", "-m", "feature work")
+		baseDropGit(t, src, "merge", "main", "-m", "clean base merge")
+		write("legacy line\nauthor edit\n")
+		baseDropGit(t, src, "commit", "-am", "edit merged line later")
+	case "rename_after_merge":
+		if err := os.WriteFile(filepath.Join(src, "feature.txt"), []byte("feature work\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		baseDropGit(t, src, "add", "feature.txt")
+		baseDropGit(t, src, "commit", "-m", "feature work")
+		baseDropGit(t, src, "merge", "main", "-m", "clean base merge")
+		baseDropGit(t, src, "mv", "tracked.txt", "renamed.txt")
+		baseDropGit(t, src, "commit", "-m", "rename merged file")
+	case "combine":
+		write("feature side\n")
+		baseDropGit(t, src, "commit", "-am", "feature changes target")
+		cmd := exec.Command("git", "-C", src, "merge", "main", "-m", "combine both sides")
+		if out, err := cmd.CombinedOutput(); err == nil {
+			t.Fatalf("expected merge conflict, got success: %s", out)
+		}
+		write("combined base and feature sides\n")
+		baseDropGit(t, src, "add", "tracked.txt")
+		baseDropGit(t, src, "commit", "-m", "resolve by combining both sides")
 	case "no_merge":
 		write("branch edit\n")
 		baseDropGit(t, src, "commit", "-am", "edit pre-fork line")
@@ -75,6 +120,12 @@ func TestGateBaseChangeDropped(t *testing.T) {
 	}{
 		{mode: "drop", want: "base_change_dropped:1"},
 		{mode: "both", want: ""},
+		{mode: "edit_after_merge", want: ""},
+		{mode: "rename_after_merge", want: ""},
+		// The base's exact added line is absent from the merge tree. Under the
+		// gate's line-survival definition, replacing it with a combined line is
+		// a drop even though the author intended to preserve its meaning.
+		{mode: "combine", want: "base_change_dropped:1"},
 		{mode: "no_merge", want: ""},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
@@ -132,6 +183,38 @@ func TestGateBaseChangeDroppedUnknownFailsClosed(t *testing.T) {
 	}
 	if v.State != "blocked" || !strings.Contains(strings.Join(v.Reasons, ","), "base_change_dropped:unknown") {
 		t.Fatalf("failed local check did not hold gate: %+v", v)
+	}
+}
+
+type baseDropCountingRunner struct {
+	next  *realGitRunner
+	calls int
+}
+
+func (r *baseDropCountingRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	if command == "git" {
+		r.calls++
+	}
+	return r.next.Run(ctx, command, args, input, dir)
+}
+
+func TestGateBaseChangeDroppedCachesUnchangedVerdict(t *testing.T) {
+	root, base, head := baseDropRepo(t, "drop")
+	s, g, _, _, r := setup(t)
+	r.Root = root
+	runner := &baseDropCountingRunner{next: &realGitRunner{fakeRunner: *s.Runner.(*fakeRunner)}}
+	s.Runner = runner
+	g.pull.Base = github.Ref{Ref: "main", SHA: base}
+	g.pull.Head = github.Ref{Ref: "feature", SHA: head}
+	g.pull.Head.Repo.FullName = r.Name
+	first, err := s.baseChangesDropped(context.Background(), r, g.pull)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first check = %v, %v", first, err)
+	}
+	calls := runner.calls
+	second, err := s.baseChangesDropped(context.Background(), r, g.pull)
+	if err != nil || len(second) != 1 || runner.calls != calls {
+		t.Fatalf("cached check = %v, %v; git calls grew %d -> %d", second, err, calls, runner.calls)
 	}
 }
 

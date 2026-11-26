@@ -417,7 +417,7 @@ func panewireSetup(t *testing.T, runner *panewireRunner) (*Service, *fakeGH, con
 	t.Helper()
 	s, g, _, _, r := setup(t)
 	g.fixtureTask = false
-	s.Runner = noMergeGitRunner{next: runner}
+	s.Runner = panewireNoMergeGitRunner{noMergeGitRunner: noMergeGitRunner{next: runner}}
 	sink := &taskJobSink{job: "author-job", title: "Fix the thing (grade A, T2)", files: map[string][]byte{}, jobs: map[string]integrations.JobRecord{}, svc: s}
 	s.Sink = sink
 	runner.sink = sink
