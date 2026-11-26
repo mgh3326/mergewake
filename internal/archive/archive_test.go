@@ -389,7 +389,17 @@ func TestResumeOldManifestCacheFilesAndRejectOtherDifferences(t *testing.T) {
 		write(t, filepath.Join(dir, "report.md"), "report\n")
 		write(t, filepath.Join(dir, "node_modules/pkg/index.js"), "node\n")
 		write(t, filepath.Join(dir, ".gocache/build.bin"), "go cache\n")
+		write(t, filepath.Join(dir, "node_modules/js-tokens/index.js"), "credential-like\n")
+		write(t, filepath.Join(dir, "node_modules/._metadata"), "apple double\n")
+		write(t, filepath.Join(dir, "node_modules/large.bin"), "123456789")
+		if err := os.MkdirAll(filepath.Join(dir, "node_modules/.bin"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink("../pkg/index.js", filepath.Join(dir, "node_modules/.bin/tool")); err != nil {
+			t.Fatal(err)
+		}
 		a := archiver(e, "")
+		a.DriveMaxFileBytes = 4
 		h := reap.Host{Name: "h1", Jobs: e.jobs}
 		p, err := a.Plan(context.Background(), h, filepath.Base(dir))
 		if err != nil {
@@ -412,6 +422,10 @@ func TestResumeOldManifestCacheFilesAndRejectOtherDifferences(t *testing.T) {
 		for _, rel := range []string{"node_modules/pkg/index.js", ".gocache/build.bin"} {
 			m.Files = append(m.Files, File{Path: rel, Size: int64(len("legacy cache")), SHA256: strings.Repeat("a", 64)})
 		}
+		m.Excluded = append(m.Excluded, "node_modules/js-tokens/index.js")
+		m.Skipped = append(m.Skipped, "node_modules/.bin/tool")
+		m.AppleDouble = append(m.AppleDouble, "node_modules/._metadata")
+		m.Oversized = append(m.Oversized, File{Path: "node_modules/large.bin", Size: 9, SHA256: strings.Repeat("b", 64)})
 		b, err = json.Marshal(m)
 		if err != nil {
 			t.Fatal(err)
@@ -428,43 +442,61 @@ func TestResumeOldManifestCacheFilesAndRejectOtherDifferences(t *testing.T) {
 			t.Fatalf("resume apply=%+v err=%v", res, err)
 		}
 	})
-	t.Run("non-cache difference still skips", func(t *testing.T) {
-		e := setup(t)
-		dir := job(t, e.jobs, "wk-resume-non-cache-change")
-		a := archiver(e, "")
-		h := reap.Host{Name: "h1", Jobs: e.jobs}
-		p, err := a.Plan(context.Background(), h, filepath.Base(dir))
-		if err != nil {
-			t.Fatal(err)
-		}
-		e.run.failRm = true
-		if _, err := a.Apply(context.Background(), p, time.Now()); err == nil {
-			t.Fatal("expected simulated delete failure")
-		}
-		e.run.failRm = false
-		manifestPath := filepath.Join(p.Dest, "manifest.json")
-		b, err := os.ReadFile(manifestPath)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var m manifest
-		if err := json.Unmarshal(b, &m); err != nil {
-			t.Fatal(err)
-		}
-		m.Files = append(m.Files, File{Path: "unexpected.txt", Size: 1, SHA256: strings.Repeat("a", 64)})
-		b, err = json.Marshal(m)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(manifestPath, b, 0o644); err != nil {
-			t.Fatal(err)
-		}
-		p, err = a.Plan(context.Background(), h, filepath.Base(dir))
-		var skip *Skip
-		if !errors.As(err, &skip) || skip.Reason != "drive-dir-exists" {
-			t.Fatalf("plan=%+v err=%v, want drive-dir-exists", p, err)
-		}
-	})
+	for _, field := range []string{"excluded", "skipped", "appledouble", "oversized"} {
+		t.Run("non-cache "+field+" difference still skips", func(t *testing.T) {
+			e := setup(t)
+			dir := filepath.Join(e.jobs, "wk-resume-non-cache-change")
+			write(t, filepath.Join(dir, "report.md"), "report\n")
+			if field == "oversized" {
+				write(t, filepath.Join(dir, "large.bin"), "123456789")
+			}
+			a := archiver(e, "")
+			if field == "oversized" {
+				a.DriveMaxFileBytes = 4
+			}
+			h := reap.Host{Name: "h1", Jobs: e.jobs}
+			p, err := a.Plan(context.Background(), h, filepath.Base(dir))
+			if err != nil {
+				t.Fatal(err)
+			}
+			e.run.failRm = true
+			if _, err := a.Apply(context.Background(), p, time.Now()); err == nil {
+				t.Fatal("expected simulated delete failure")
+			}
+			e.run.failRm = false
+			manifestPath := filepath.Join(p.Dest, "manifest.json")
+			b, err := os.ReadFile(manifestPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var m manifest
+			if err := json.Unmarshal(b, &m); err != nil {
+				t.Fatal(err)
+			}
+			switch field {
+			case "excluded":
+				m.Excluded = append(m.Excluded, "unexpected.txt")
+			case "skipped":
+				m.Skipped = append(m.Skipped, "unexpected.txt")
+			case "appledouble":
+				m.AppleDouble = append(m.AppleDouble, "._unexpected")
+			case "oversized":
+				m.Oversized = append(m.Oversized, File{Path: "unexpected.txt", Size: 1, SHA256: strings.Repeat("a", 64)})
+			}
+			b, err = json.Marshal(m)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(manifestPath, b, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			p, err = a.Plan(context.Background(), h, filepath.Base(dir))
+			var skip *Skip
+			if !errors.As(err, &skip) || skip.Reason != "drive-dir-exists" {
+				t.Fatalf("plan=%+v err=%v, want drive-dir-exists", p, err)
+			}
+		})
+	}
 }
 
 func TestArchiveEmptyCachePathsCopiesCacheFiles(t *testing.T) {

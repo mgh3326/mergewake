@@ -1072,10 +1072,28 @@ func (m *manifest) matches(p *Plan, cachePaths []string) bool {
 			files = append(files, f)
 		}
 	}
-	if m.Job != p.Job || m.Host != p.Host || m.Task != p.Task || len(files) != len(p.Move) || len(m.Oversized) != len(p.Oversized) || !sameStrings(m.Excluded, p.Excluded) || !sameStrings(m.Skipped, p.Skipped) || !sameStrings(m.AppleDouble, p.AppleDouble) {
+	filterPaths := func(paths []string) []string {
+		filtered := make([]string, 0, len(paths))
+		for _, name := range paths {
+			if !isCachePath(name, cachePaths) {
+				filtered = append(filtered, name)
+			}
+		}
+		return filtered
+	}
+	excluded := filterPaths(m.Excluded)
+	skipped := filterPaths(m.Skipped)
+	appleDouble := filterPaths(m.AppleDouble)
+	oversized := make([]File, 0, len(m.Oversized))
+	for _, f := range m.Oversized {
+		if !isCachePath(f.Path, cachePaths) {
+			oversized = append(oversized, f)
+		}
+	}
+	if m.Job != p.Job || m.Host != p.Host || m.Task != p.Task || len(files) != len(p.Move) || len(oversized) != len(p.Oversized) || !sameStrings(excluded, p.Excluded) || !sameStrings(skipped, p.Skipped) || !sameStrings(appleDouble, p.AppleDouble) {
 		return false
 	}
-	for i, f := range m.Oversized {
+	for i, f := range oversized {
 		if f.Path != p.Oversized[i].Path || f.Size != p.Oversized[i].Size || f.SHA256 == "" || f.SHA256 != p.oversizedHashes[f.Path] {
 			return false
 		}
