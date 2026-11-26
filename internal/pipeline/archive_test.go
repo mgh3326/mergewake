@@ -2242,3 +2242,78 @@ func TestArchiveJobsResumeDeleteLegacyRetainedRecordsArchived(t *testing.T) {
 		t.Fatalf("resumed deleted job recorded %q (%s), want archived", last.Result, last.Reason)
 	}
 }
+
+// archiveDriveReadBlockRunner blocks the planner's Drive read of one job's
+// manifest until the read's context ends: a cat when op is "cat", an existence
+// probe when op is "exists". Every other command runs on the base runner.
+type archiveDriveReadBlockRunner struct {
+	base  integrations.Runner
+	op    string
+	match string
+}
+
+func (r archiveDriveReadBlockRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
+	line := name + " " + strings.Join(args, " ")
+	blocked := strings.Contains(line, r.match) && strings.Contains(line, "manifest.json") &&
+		((r.op == "cat" && name == "cat") || (r.op == "exists" && strings.Contains(line, "test -e")))
+	if blocked {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return r.base.Run(ctx, name, args, input, dir)
+}
+
+// A Drive manifest read that stalls costs its own job, not the run: the job is
+// skipped with drive-read-timeout, the next job is still archived, and the run
+// does not stop on max_run.
+func TestArchiveJobsDriveManifestCatTimeoutSkipsJobAndContinues(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.MaxRun = "5s"
+	f.s.Config.Reap.Archive.DriveReadTimeout = "50ms"
+	jobDir(t, f.jobs, "bad-job", 20*24*time.Hour)
+	jobDir(t, f.jobs, "good-job", 21*24*time.Hour)
+	writeFile(t, filepath.Join(f.drive, "tasks", "77", "bad-job", "manifest.json"), "{}")
+	f.s.Runner = archiveDriveReadBlockRunner{base: f.run, op: "cat", match: "bad-job"}
+	started := time.Now()
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatalf("stalled manifest read failed the run: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("stalled read held the run for %s", elapsed)
+	}
+	out := f.out.String()
+	for _, want := range []string{`"job":"bad-job","result":"skipped","reason":"drive-read-timeout"`, `"job":"good-job","result":"would-archive"`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %s in output: %s", want, out)
+		}
+	}
+	if strings.Contains(out, `"stopped_on_budget":true`) {
+		t.Fatalf("per-read timeout reported as max_run stop: %s", out)
+	}
+}
+
+// The same bound covers the existence probe that precedes the manifest read.
+func TestArchiveJobsDriveManifestExistsTimeoutSkipsJobAndContinues(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	f.s.Config.Reap.Archive.MaxRun = "5s"
+	f.s.Config.Reap.Archive.DriveReadTimeout = "50ms"
+	jobDir(t, f.jobs, "bad-job", 20*24*time.Hour)
+	jobDir(t, f.jobs, "good-job", 21*24*time.Hour)
+	f.s.Runner = archiveDriveReadBlockRunner{base: f.run, op: "exists", match: "bad-job"}
+	started := time.Now()
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{Shadow: true}); err != nil {
+		t.Fatalf("stalled existence probe failed the run: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("stalled probe held the run for %s", elapsed)
+	}
+	out := f.out.String()
+	for _, want := range []string{`"job":"bad-job","result":"skipped","reason":"drive-read-timeout"`, `"job":"good-job","result":"would-archive"`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %s in output: %s", want, out)
+		}
+	}
+	if strings.Contains(out, `"stopped_on_budget":true`) {
+		t.Fatalf("per-read timeout reported as max_run stop: %s", out)
+	}
+}

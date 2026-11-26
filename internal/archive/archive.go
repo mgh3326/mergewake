@@ -121,7 +121,16 @@ type Archiver struct {
 	CachePaths        []string
 	TextMax           int64
 	DriveMaxFileBytes int64
+	// DriveReadTimeout bounds each Drive read the planner makes; zero means
+	// DefaultDriveReadTimeout.
+	DriveReadTimeout time.Duration
 }
+
+// DefaultDriveReadTimeout bounds one planner read of a Drive file: an existence
+// probe or the manifest cat. A healthy read of a local file takes well under a
+// second. A file the Drive mount has not fetched yet can block far longer, and
+// that job alone should give way to the rest of the run.
+const DefaultDriveReadTimeout = time.Minute
 
 // ExcludedName reports whether a job name matches any configured shell glob.
 func ExcludedName(patterns []string, job string) bool {
@@ -509,6 +518,49 @@ func (a *Archiver) exists(ctx context.Context, ssh, p string) (bool, error) {
 	return strings.TrimSpace(string(b)) == "yes", nil
 }
 
+// driveRead runs one planner read of a Drive file under its own bound. A read
+// that outlives the bound while ctx is still live is a skip of this job, with
+// the reason "drive-read-timeout". The run's own deadline or a cancellation
+// passes through unchanged, so the run's max_run classification still holds.
+func (a *Archiver) driveRead(ctx context.Context, read func(context.Context) error) error {
+	d := a.DriveReadTimeout
+	if d <= 0 {
+		d = DefaultDriveReadTimeout
+	}
+	rctx, cancel := context.WithTimeout(ctx, d)
+	defer cancel()
+	err := read(rctx)
+	if err != nil && ctx.Err() == nil && rctx.Err() != nil {
+		return &Skip{"drive-read-timeout"}
+	}
+	return err
+}
+
+// driveExists is exists under the Drive read bound.
+func (a *Archiver) driveExists(ctx context.Context, p string) (bool, error) {
+	var done bool
+	err := a.driveRead(ctx, func(rctx context.Context) error {
+		var err error
+		done, err = a.exists(rctx, a.SSH, p)
+		return err
+	})
+	return done, err
+}
+
+// driveManifest reads a finished manifest.json under the Drive read bound.
+func (a *Archiver) driveManifest(ctx context.Context, mpath string) ([]byte, error) {
+	var raw []byte
+	err := a.driveRead(ctx, func(rctx context.Context) error {
+		var err error
+		raw, err = a.on(rctx, a.SSH, "", "cat", mpath)
+		if err != nil {
+			return a.readFailure(path.Base(mpath), err)
+		}
+		return nil
+	})
+	return raw, err
+}
+
 const archiveLockTTL = int64(24 * 60 * 60)
 
 // lockGuard serializes every change to the lock, including release. The
@@ -650,13 +702,13 @@ func guardHeldError(out string) error {
 
 func (a *Archiver) existingManifest(ctx context.Context, p *Plan) (bool, error) {
 	mpath := path.Join(p.Dest, "manifest.json")
-	done, err := a.exists(ctx, a.SSH, mpath)
+	done, err := a.driveExists(ctx, mpath)
 	if err != nil || !done {
 		return done, err
 	}
-	raw, err := a.on(ctx, a.SSH, "", "cat", mpath)
+	raw, err := a.driveManifest(ctx, mpath)
 	if err != nil {
-		return false, a.readFailure(path.Base(mpath), err)
+		return false, err
 	}
 	var m manifest
 	if json.Unmarshal(raw, &m) != nil {
@@ -977,7 +1029,7 @@ func (a *Archiver) planListed(ctx context.Context, h reap.Host, job, dir string,
 		p.Dest = path.Join(a.DriveDir, "tasks", p.Task, job)
 	}
 	mpath := path.Join(p.Dest, "manifest.json")
-	done, err := a.exists(ctx, a.SSH, mpath)
+	done, err := a.driveExists(ctx, mpath)
 	if err != nil {
 		return nil, err
 	}
@@ -985,9 +1037,9 @@ func (a *Archiver) planListed(ctx context.Context, h reap.Host, job, dir string,
 		// manifest.json is written last, after the hk comment, so it marks a
 		// finished archive. Only the same job with the same files may resume
 		// to the delete; anything else never overwrites it.
-		raw, err := a.on(ctx, a.SSH, "", "cat", mpath)
+		raw, err := a.driveManifest(ctx, mpath)
 		if err != nil {
-			return nil, a.readFailure(path.Base(mpath), err)
+			return nil, err
 		}
 		var m manifest
 		if json.Unmarshal(raw, &m) != nil {

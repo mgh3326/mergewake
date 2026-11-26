@@ -22,7 +22,8 @@ import (
 
 func (s *Service) archiver() *archive.Archiver {
 	a := s.Config.Reap.Archive
-	return &archive.Archiver{Runner: s.Runner, DriveDir: a.DriveDir, SSH: a.ArchiveHost, Exclude: a.Exclude, CachePaths: a.CachePaths, TextMax: a.TextMaxBytes, DriveMaxFileBytes: a.DriveMaxFileBytes}
+	driveRead, _ := config.OptionalDuration(a.DriveReadTimeout)
+	return &archive.Archiver{Runner: s.Runner, DriveDir: a.DriveDir, SSH: a.ArchiveHost, Exclude: a.Exclude, CachePaths: a.CachePaths, TextMax: a.TextMaxBytes, DriveMaxFileBytes: a.DriveMaxFileBytes, DriveReadTimeout: driveRead}
 }
 
 func (s *Service) refreshArchivePane(ctx context.Context, hs *reapHost, root, job string) error {
