@@ -750,6 +750,90 @@ func TestArchiveRemoveScriptRemovesReadOnlyTree(t *testing.T) {
 	}
 }
 
+// A legacy manifest that lists cache-path files must survive a resume whose
+// checkout state changed: the republished manifest keeps every entry and the
+// original TotalBytes, not the cache-filtered view used for the Result.
+func TestResumeRepublishKeepsRawLegacyCacheManifest(t *testing.T) {
+	e := setup(t)
+	dir := job(t, e.jobs, "wk-resume-raw-republish")
+	finishJob(t, dir)
+	checkout := filepath.Join(dir, "wt")
+	pushedCheckout(t, checkout)
+	a := archiver(e, "")
+	h := reap.Host{Name: "h1", Jobs: e.jobs}
+	p, err := a.Plan(context.Background(), h, filepath.Base(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.run.failRm = true
+	if _, err := a.Apply(context.Background(), p, time.Now()); err == nil {
+		t.Fatal("expected simulated delete failure")
+	}
+	e.run.failRm = false
+	manifestPath := filepath.Join(p.Dest, "manifest.json")
+	b, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m manifest
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []File{
+		{Path: "node_modules/pkg/index.js", Size: 11, SHA256: strings.Repeat("a", 64)},
+		{Path: ".gocache/build.bin", Size: 12, SHA256: strings.Repeat("b", 64)},
+	} {
+		m.Files = append(m.Files, f)
+		m.TotalBytes += f.Size
+	}
+	wantBytes := m.TotalBytes
+	b, err = json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resumePlan, err := a.Plan(context.Background(), h, filepath.Base(dir))
+	if err != nil || !resumePlan.Resume {
+		t.Fatalf("legacy cache manifest did not resume: plan=%+v err=%v", resumePlan, err)
+	}
+	// The checkout changes between plan and remove, so remove republishes.
+	if err := os.WriteFile(filepath.Join(checkout, "tracked.txt"), []byte("edit after plan\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := a.Apply(context.Background(), resumePlan, time.Now())
+	if err != nil || !res.Deleted {
+		t.Fatalf("resume apply=%+v err=%v", res, err)
+	}
+	b, err = os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var republished manifest
+	if err := json.Unmarshal(b, &republished); err != nil {
+		t.Fatal(err)
+	}
+	cacheKept := 0
+	for _, f := range republished.Files {
+		if f.Path == "node_modules/pkg/index.js" || f.Path == ".gocache/build.bin" {
+			cacheKept++
+		}
+	}
+	if cacheKept != 2 || republished.TotalBytes != wantBytes {
+		t.Fatalf("republished manifest cache files=%d total_bytes=%d, want 2 and %d", cacheKept, republished.TotalBytes, wantBytes)
+	}
+	dirty := false
+	for _, x := range republished.ExcludedEntries {
+		if x.Path == "wt" && x.Reason == "git-tracked" && x.State == "dirty" {
+			dirty = true
+		}
+	}
+	if !dirty {
+		t.Fatalf("republished manifest does not record final checkout state: %+v", republished.ExcludedEntries)
+	}
+}
+
 func TestArchiveCheckoutEditDuringPublishIsRecordedBeforeDeletion(t *testing.T) {
 	e := setup(t)
 	dir := job(t, e.jobs, "wk-edit-during-publish")
