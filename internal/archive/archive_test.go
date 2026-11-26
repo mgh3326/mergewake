@@ -382,6 +382,30 @@ func TestArchiveCacheRootsChooseOutermost(t *testing.T) {
 	}
 }
 
+func TestArchiveCacheCountSkipsFilesInsideNestedCheckout(t *testing.T) {
+	e := setup(t)
+	dir := filepath.Join(e.jobs, "wk-nested-checkout-cache")
+	write(t, filepath.Join(dir, "repo", ".git"), "gitdir: ../.git/worktrees/repo\n")
+	write(t, filepath.Join(dir, "repo", "node_modules", "a.js"), "inside checkout\n")
+	write(t, filepath.Join(dir, ".gocache", "x"), "outside checkout\n")
+	finishJob(t, dir)
+	a := archiver(e, "")
+	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, filepath.Base(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]int{}
+	for _, x := range p.ExcludedEntries {
+		if x.Reason == "git-tracked" || x.Reason == "cache" {
+			got[x.Reason+" "+x.Path] = x.Files
+		}
+	}
+	want := map[string]int{"git-tracked repo": 2, "cache .gocache": 1}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("checkout and cache exclusions = %v, want %v", got, want)
+	}
+}
+
 func TestResumeOldManifestCacheFilesAndRejectOtherDifferences(t *testing.T) {
 	t.Run("cache files resume through delete", func(t *testing.T) {
 		e := setup(t)

@@ -862,6 +862,10 @@ func (a *Archiver) planListed(ctx context.Context, h reap.Host, job, dir string,
 	sort.Slice(p.ExcludedEntries, func(i, j int) bool { return p.ExcludedEntries[i].Path < p.ExcludedEntries[j].Path })
 	cacheCounts := map[string]int{}
 	for _, f := range files {
+		// A file inside a nested checkout stays under that checkout's git-tracked entry.
+		if inCheckout(f.Path, checkouts) {
+			continue
+		}
 		if root, ok := cacheRoot(f.Path, a.CachePaths); ok && f.kind == 'f' {
 			cacheCounts[root]++
 		}
