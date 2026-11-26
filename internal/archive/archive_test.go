@@ -354,6 +354,119 @@ func TestArchiveCachePathsAreExcludedAndDeleted(t *testing.T) {
 	}
 }
 
+func TestArchiveCacheRootsChooseOutermost(t *testing.T) {
+	e := setup(t)
+	dir := filepath.Join(e.jobs, "wk-cache-outermost")
+	for _, rel := range []string{
+		".venv/lib/python3.12/site-packages/a/__pycache__/x.pyc",
+		".venv/lib/python3.12/site-packages/b/__pycache__/y.pyc",
+		".venv/pyvenv.cfg",
+		".cache/go-build/00/abc",
+	} {
+		write(t, filepath.Join(dir, rel), "cache\n")
+	}
+	a := archiver(e, "")
+	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, filepath.Base(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int{".venv": 3, ".cache": 1}
+	got := map[string]int{}
+	for _, x := range p.ExcludedEntries {
+		if x.Reason == "cache" {
+			got[x.Path] += x.Files
+		}
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("cache exclusions = %v, want %v", got, want)
+	}
+}
+
+func TestResumeOldManifestCacheFilesAndRejectOtherDifferences(t *testing.T) {
+	t.Run("cache files resume through delete", func(t *testing.T) {
+		e := setup(t)
+		dir := filepath.Join(e.jobs, "wk-resume-old-cache")
+		write(t, filepath.Join(dir, "report.md"), "report\n")
+		write(t, filepath.Join(dir, "node_modules/pkg/index.js"), "node\n")
+		write(t, filepath.Join(dir, ".gocache/build.bin"), "go cache\n")
+		a := archiver(e, "")
+		h := reap.Host{Name: "h1", Jobs: e.jobs}
+		p, err := a.Plan(context.Background(), h, filepath.Base(dir))
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.run.failRm = true
+		if _, err := a.Apply(context.Background(), p, time.Now()); err == nil {
+			t.Fatal("expected simulated delete failure")
+		}
+		e.run.failRm = false
+		manifestPath := filepath.Join(p.Dest, "manifest.json")
+		b, err := os.ReadFile(manifestPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m manifest
+		if err := json.Unmarshal(b, &m); err != nil {
+			t.Fatal(err)
+		}
+		for _, rel := range []string{"node_modules/pkg/index.js", ".gocache/build.bin"} {
+			m.Files = append(m.Files, File{Path: rel, Size: int64(len("legacy cache")), SHA256: strings.Repeat("a", 64)})
+		}
+		b, err = json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(manifestPath, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		p, err = a.Plan(context.Background(), h, filepath.Base(dir))
+		if err != nil || !p.Resume {
+			t.Fatalf("legacy cache manifest did not resume: plan=%+v err=%v", p, err)
+		}
+		res, err := a.Apply(context.Background(), p, time.Now())
+		if err != nil || !res.Deleted {
+			t.Fatalf("resume apply=%+v err=%v", res, err)
+		}
+	})
+	t.Run("non-cache difference still skips", func(t *testing.T) {
+		e := setup(t)
+		dir := job(t, e.jobs, "wk-resume-non-cache-change")
+		a := archiver(e, "")
+		h := reap.Host{Name: "h1", Jobs: e.jobs}
+		p, err := a.Plan(context.Background(), h, filepath.Base(dir))
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.run.failRm = true
+		if _, err := a.Apply(context.Background(), p, time.Now()); err == nil {
+			t.Fatal("expected simulated delete failure")
+		}
+		e.run.failRm = false
+		manifestPath := filepath.Join(p.Dest, "manifest.json")
+		b, err := os.ReadFile(manifestPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m manifest
+		if err := json.Unmarshal(b, &m); err != nil {
+			t.Fatal(err)
+		}
+		m.Files = append(m.Files, File{Path: "unexpected.txt", Size: 1, SHA256: strings.Repeat("a", 64)})
+		b, err = json.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(manifestPath, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		p, err = a.Plan(context.Background(), h, filepath.Base(dir))
+		var skip *Skip
+		if !errors.As(err, &skip) || skip.Reason != "drive-dir-exists" {
+			t.Fatalf("plan=%+v err=%v, want drive-dir-exists", p, err)
+		}
+	})
+}
+
 func TestArchiveEmptyCachePathsCopiesCacheFiles(t *testing.T) {
 	e := setup(t)
 	dir := filepath.Join(e.jobs, "wk-cache-paths-disabled")

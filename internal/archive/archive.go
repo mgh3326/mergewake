@@ -247,6 +247,8 @@ func Credential(p string) bool {
 
 func cacheRoot(file string, roots []string) (string, bool) {
 	segs := strings.Split(file, "/")
+	bestEnd := len(segs) + 1
+	best := ""
 	for _, root := range roots {
 		rootSegs := strings.Split(strings.TrimSuffix(root, "/"), "/")
 		if root == "" || len(rootSegs) == 0 {
@@ -260,12 +262,14 @@ func cacheRoot(file string, roots []string) (string, bool) {
 					break
 				}
 			}
-			if matches {
-				return strings.Join(segs[:i+len(rootSegs)], "/"), true
+			end := i + len(rootSegs)
+			if matches && end < bestEnd {
+				bestEnd = end
+				best = strings.Join(segs[:end], "/")
 			}
 		}
 	}
-	return "", false
+	return best, best != ""
 }
 
 func isCachePath(file string, roots []string) bool {
@@ -651,7 +655,7 @@ func (a *Archiver) existingManifest(ctx context.Context, p *Plan) (bool, error) 
 		return false, a.readFailure(path.Base(mpath), err)
 	}
 	var m manifest
-	if json.Unmarshal(raw, &m) != nil || !m.matches(p) {
+	if json.Unmarshal(raw, &m) != nil || !m.matches(p, a.CachePaths) {
 		return false, &Skip{"drive-dir-exists"}
 	}
 	p.Resume, p.done, p.doneRaw = true, &m, raw
@@ -974,7 +978,7 @@ func (a *Archiver) planListed(ctx context.Context, h reap.Host, job, dir string,
 			return nil, a.readFailure(path.Base(mpath), err)
 		}
 		var m manifest
-		if json.Unmarshal(raw, &m) != nil || !m.matches(p) {
+		if json.Unmarshal(raw, &m) != nil || !m.matches(p, a.CachePaths) {
 			return nil, &Skip{"drive-dir-exists"}
 		}
 		p.Resume, p.done, p.doneRaw = true, &m, raw
@@ -1061,8 +1065,14 @@ func HostSkipReason(job HostJobSummary) (reason string, newest int64) {
 	return "", job.Newest
 }
 
-func (m *manifest) matches(p *Plan) bool {
-	if m.Job != p.Job || m.Host != p.Host || m.Task != p.Task || len(m.Files) != len(p.Move) || len(m.Oversized) != len(p.Oversized) || !sameStrings(m.Excluded, p.Excluded) || !sameStrings(m.Skipped, p.Skipped) || !sameStrings(m.AppleDouble, p.AppleDouble) {
+func (m *manifest) matches(p *Plan, cachePaths []string) bool {
+	files := make([]File, 0, len(m.Files))
+	for _, f := range m.Files {
+		if !isCachePath(f.Path, cachePaths) {
+			files = append(files, f)
+		}
+	}
+	if m.Job != p.Job || m.Host != p.Host || m.Task != p.Task || len(files) != len(p.Move) || len(m.Oversized) != len(p.Oversized) || !sameStrings(m.Excluded, p.Excluded) || !sameStrings(m.Skipped, p.Skipped) || !sameStrings(m.AppleDouble, p.AppleDouble) {
 		return false
 	}
 	for i, f := range m.Oversized {
@@ -1074,7 +1084,7 @@ func (m *manifest) matches(p *Plan) bool {
 	for _, f := range p.entries {
 		size[f.Path] = f.Size
 	}
-	for i, f := range m.Files {
+	for i, f := range files {
 		if f.Path != p.Move[i] || f.Size != size[f.Path] || len(f.SHA256) != 64 {
 			return false
 		}
@@ -1632,7 +1642,7 @@ func (a *Archiver) resume(ctx context.Context, p *Plan, src map[string]string) (
 	sum := sha256.Sum256(p.doneRaw)
 	res := &Result{Dest: p.Dest, Task: p.Task, Files: len(m.Files), Bytes: m.TotalBytes, Manifest: hex.EncodeToString(sum[:]), Excluded: m.Excluded, Retained: m.Retained}
 	for _, f := range m.Files {
-		if src[f.Path] != f.SHA256 {
+		if src[f.Path] != f.SHA256 && !isCachePath(f.Path, a.CachePaths) {
 			cur, err := a.instance(ctx, p.host.SSH, p.Dir)
 			if err != nil {
 				return nil, err
