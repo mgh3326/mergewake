@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/hktest"
 	"github.com/mgh3326/mergewake/internal/reap"
 )
@@ -224,7 +225,7 @@ func finishJob(t *testing.T, dir string) {
 }
 
 func archiver(e env, ssh string) *Archiver {
-	return &Archiver{Runner: e.run, DriveDir: e.drive, SSH: ssh, TextMax: 1024}
+	return &Archiver{Runner: e.run, DriveDir: e.drive, SSH: ssh, TextMax: 1024, CachePaths: append([]string(nil), config.DefaultArchiveCachePaths...)}
 }
 
 func TestPlanDriveMaxFileBytesMovesSmallAndListsLarge(t *testing.T) {
@@ -263,6 +264,80 @@ func TestPlanDriveMaxFileBytesMovesSmallAndListsLarge(t *testing.T) {
 	}
 }
 
+func TestArchiveCachePathsAreExcludedAndDeleted(t *testing.T) {
+	e := setup(t)
+	dir := filepath.Join(e.jobs, "wk-cache-paths")
+	write(t, filepath.Join(dir, "tmp/home/go/pkg/mod/example.test/mod/@v/v1.zip"), "module cache\n")
+	write(t, filepath.Join(dir, "node_modules/pkg/index.js"), "node cache\n")
+	write(t, filepath.Join(dir, "__pycache__/module.pyc"), "python cache\n")
+	write(t, filepath.Join(dir, "node_modules_notes.md"), "keep this\n")
+	write(t, filepath.Join(dir, "report.md"), "keep this too\n")
+	if err := os.Chmod(filepath.Join(dir, "tmp/home/go/pkg/mod/example.test/mod/@v/v1.zip"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	finishJob(t, dir)
+	a := archiver(e, "")
+	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, filepath.Base(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(p.Move, ",") != "events/00005-job.completed.json,node_modules_notes.md,report.md" {
+		t.Fatalf("move=%v", p.Move)
+	}
+	want := map[string]int{"tmp/home/go/pkg/mod": 1, "node_modules": 1, "__pycache__": 1}
+	for _, x := range p.ExcludedEntries {
+		if x.Reason == "cache" {
+			if want[x.Path] != x.Files {
+				t.Errorf("cache exclusion=%+v", x)
+			}
+			delete(want, x.Path)
+		}
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing cache exclusions: %v", want)
+	}
+	res, err := a.Apply(context.Background(), p, time.Now())
+	if err != nil || !res.Deleted {
+		t.Fatalf("apply=%+v err=%v", res, err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("source remains after archive: %v", err)
+	}
+	for _, rel := range []string{"node_modules_notes.md", "report.md"} {
+		if _, err := os.Stat(filepath.Join(p.Dest, rel)); err != nil {
+			t.Fatalf("missing copied %s: %v", rel, err)
+		}
+	}
+	for _, rel := range []string{"tmp/home/go/pkg/mod/example.test/mod/@v/v1.zip", "node_modules/pkg/index.js", "__pycache__/module.pyc"} {
+		if _, err := os.Stat(filepath.Join(p.Dest, rel)); !os.IsNotExist(err) {
+			t.Fatalf("cache copied %s: %v", rel, err)
+		}
+	}
+}
+
+func TestArchiveEmptyCachePathsCopiesCacheFiles(t *testing.T) {
+	e := setup(t)
+	dir := filepath.Join(e.jobs, "wk-cache-paths-disabled")
+	write(t, filepath.Join(dir, "node_modules/pkg/index.js"), "node cache\n")
+	write(t, filepath.Join(dir, "events", "00001-job.task_link.json"), `{"payload":{"task_id":2402}}`)
+	finishJob(t, dir)
+	a := archiver(e, "")
+	a.CachePaths = []string{}
+	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, filepath.Base(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(p.Move, "\n"), "node_modules/pkg/index.js") {
+		t.Fatalf("cache file not planned for copy: %v", p.Move)
+	}
+	if _, err := a.Apply(context.Background(), p, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(p.Dest, "node_modules/pkg/index.js")); err != nil {
+		t.Fatalf("cache file not copied: %v", err)
+	}
+}
+
 func TestArchiveTaskLayoutSkipsGitCheckoutAndSecretText(t *testing.T) {
 	e := setup(t)
 	dir := filepath.Join(e.jobs, "wk-layout-repro")
@@ -296,11 +371,11 @@ func TestArchiveTaskLayoutSkipsGitCheckoutAndSecretText(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Deleted || len(res.Retained) != 2 || res.Retained[0].Reason != "git-error" || res.Retained[1].Reason != "git-error" {
+	if !res.Deleted || len(res.Retained) != 0 {
 		t.Fatalf("unsafe checkout result=%+v", res)
 	}
-	if _, err := os.Stat(dir); err != nil {
-		t.Fatalf("unsafe source not retained: %v", err)
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("unsafe source remains: %v", err)
 	}
 	for _, rel := range []string{"report.md", "events/00001-job.task_link.json", "events/00005-job.completed.json"} {
 		if _, err := os.Stat(filepath.Join(p.Dest, rel)); err != nil {
@@ -346,25 +421,11 @@ func TestArchiveTaskLayoutSkipsGitCheckoutAndSecretText(t *testing.T) {
 	if len(e.hk.Comments()) != 1 {
 		t.Fatalf("comments=%d", len(e.hk.Comments()))
 	}
-	plan, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, "wk-layout-repro")
-	if err != nil || !plan.Resume {
-		t.Fatalf("resume plan=%+v err=%v", plan, err)
+	if !strings.Contains(e.hk.Documents()["archive/2402/wk-layout-repro"].Body, "state=git-error") {
+		t.Fatal("checkout state missing from hk doc")
 	}
-	if _, err := a.Apply(context.Background(), plan, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	if len(e.hk.Comments()) != 1 || len(e.hk.Documents()) != 1 {
-		t.Fatal("resume changed hk record")
-	}
-	res, err = a.Apply(context.Background(), plan, time.Now())
-	if err != nil || res.Deleted || len(res.Retained) != 2 {
-		t.Fatalf("unsafe resume=%+v err=%v", res, err)
-	}
-	if !strings.Contains(e.hk.Documents()["archive/2402/wk-layout-repro"].Body, "retained: checkout-unsafe wt git-error") {
-		t.Fatal("retention missing from hk doc")
-	}
-	if !strings.Contains(string(raw), `"reason": "git-error"`) {
-		t.Fatal("retention missing from manifest")
+	if !strings.Contains(string(raw), `"state": "git-error"`) {
+		t.Fatal("checkout state missing from manifest")
 	}
 }
 
@@ -411,11 +472,11 @@ func TestArchiveCheckoutSafetyControlsDeletion(t *testing.T) {
 				t.Fatal(err)
 			}
 			if tc.reason != "" {
-				if res.Deleted || len(res.Retained) != 1 || res.Retained[0] != (Retention{Path: "wt", Class: "checkout-unsafe", Reason: tc.reason}) {
+				if !res.Deleted || len(res.Retained) != 0 {
 					t.Fatalf("result=%+v", res)
 				}
-				if _, err := os.Stat(dir); err != nil {
-					t.Fatalf("source not retained: %v", err)
+				if _, err := os.Stat(dir); !os.IsNotExist(err) {
+					t.Fatalf("source remains: %v", err)
 				}
 				var m manifest
 				b, err := os.ReadFile(filepath.Join(p.Dest, "manifest.json"))
@@ -425,22 +486,17 @@ func TestArchiveCheckoutSafetyControlsDeletion(t *testing.T) {
 				if err := json.Unmarshal(b, &m); err != nil {
 					t.Fatal(err)
 				}
-				if len(m.Retained) != 1 || m.Retained[0].Class != "checkout-unsafe" || m.Retained[0].Reason != tc.reason {
-					t.Fatalf("manifest retained=%+v", m.Retained)
-				}
-				if !strings.Contains(e.hk.Documents()["archive/2402/"+filepath.Base(dir)].Body, "retained: checkout-unsafe wt "+tc.reason) {
-					t.Fatal("hk record lacks retention reason")
-				}
-				if tc.name == "modified" {
-					gitRun(t, checkout, "checkout", "--", "tracked.txt")
-					resume, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, filepath.Base(dir))
-					if err != nil || !resume.Resume {
-						t.Fatalf("safe resume plan=%+v err=%v", resume, err)
+				foundState := false
+				for _, x := range m.ExcludedEntries {
+					if x.Path == "wt" && x.Reason == "git-tracked" && x.State == tc.reason {
+						foundState = true
 					}
-					res, err = a.Apply(context.Background(), resume, time.Now())
-					if err != nil || !res.Deleted {
-						t.Fatalf("safe resume result=%+v err=%v", res, err)
-					}
+				}
+				if !foundState || len(m.Retained) != 0 {
+					t.Fatalf("manifest exclusions=%+v retained=%+v", m.ExcludedEntries, m.Retained)
+				}
+				if !strings.Contains(e.hk.Documents()["archive/2402/"+filepath.Base(dir)].Body, "state="+tc.reason) {
+					t.Fatal("hk record lacks checkout state")
 				}
 			} else if !res.Deleted || len(res.Retained) != 0 {
 				t.Fatalf("safe checkout result=%+v", res)
@@ -480,11 +536,11 @@ func TestArchiveInvalidCheckoutMarkerCannotFallBackToParentRepo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Deleted || len(res.Retained) != 1 || res.Retained[0].Reason != "git-error" {
-		t.Fatalf("invalid checkout fell back to parent repo: result=%+v", res)
+	if !res.Deleted || len(res.Retained) != 0 {
+		t.Fatalf("invalid checkout result=%+v", res)
 	}
-	if _, err := os.Stat(dir); err != nil {
-		t.Fatalf("uncheckable source was deleted: %v", err)
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("uncheckable source remains: %v", err)
 	}
 }
 

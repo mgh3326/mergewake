@@ -315,6 +315,11 @@ func TestReapConfig(t *testing.T) {
 		{"archive negative max run", "reap:\n  archive: {max_run: -1s}\n", true},
 		{"archive invalid exclude", "reap:\n  archive: {exclude: ['[']}\n", true},
 		{"archive empty exclude", "reap:\n  archive: {exclude: []}\n", false},
+		{"archive cache paths", "reap:\n  archive: {cache_paths: [vendor/cache/]}\n", false},
+		{"archive empty cache paths", "reap:\n  archive: {cache_paths: []}\n", false},
+		{"archive invalid cache path", "reap:\n  archive: {cache_paths: ['../cache/']}\n", true},
+		{"archive cache path needs directory slash", "reap:\n  archive: {cache_paths: [cache]}\n", true},
+		{"archive cache path empty segment", "reap:\n  archive: {cache_paths: ['foo//cache/']}\n", true},
 		{"archive negative drive cap", "reap:\n  archive: {drive_max_file_bytes: -1}\n", true},
 		{"archive no dir", "reap:\n  archive: {enabled: true}\n", true},
 		{"archive ssh home", "reap:\n  archive: {enabled: true, archive_host: ops@mac.example, drive_dir: '~/Drive'}\n", true},
@@ -348,6 +353,12 @@ func TestReapConfig(t *testing.T) {
 				}
 				if tt.name == "archive empty exclude" && len(c.Reap.Archive.Exclude) != 0 {
 					t.Fatalf("empty exclude = %v", c.Reap.Archive.Exclude)
+				}
+				if tt.name == "archive cache paths" && (len(c.Reap.Archive.CachePaths) != 1 || c.Reap.Archive.CachePaths[0] != "vendor/cache/") {
+					t.Fatalf("cache_paths = %v", c.Reap.Archive.CachePaths)
+				}
+				if tt.name == "archive empty cache paths" && len(c.Reap.Archive.CachePaths) != 0 {
+					t.Fatalf("empty cache_paths = %v", c.Reap.Archive.CachePaths)
 				}
 				if tt.name == "defaults" && c.Reap.Archive.DriveMaxFileBytes != 0 {
 					t.Fatalf("default drive_max_file_bytes = %d", c.Reap.Archive.DriveMaxFileBytes)
