@@ -585,7 +585,7 @@ hosts:
 					row.Result, row.Reason = archive.Reason(dropErr)
 				} else if !acting {
 					row.Result, row.Files, row.Bytes = "would-drop", count, size
-				} else if refreshErr := s.refreshArchivePane(ctx, hs, root, job); refreshErr != nil {
+				} else if refreshErr := s.refreshArchivePane(runCtx, hs, root, job); refreshErr != nil {
 					if deadlineErr(refreshErr) {
 						stoppedOnBudget = true
 						unscannedReasons[h.Name] = "max_run deadline during drop pane refresh"
@@ -596,6 +596,12 @@ hosts:
 					row.Result, row.Reason = archiveJobsReason(refreshErr)
 				} else if liveName(hs, job) || hs.paneInUse(filepath.Join(root, job)) {
 					row.Result, row.Reason = "skipped", "pane-live"
+				} else if budgetSpent() {
+					stoppedOnBudget = true
+					unscannedReasons[h.Name] = "max_run deadline before drop"
+					unscannedStart = entered - 1
+					countPendingEligible(jobIndex)
+					break hosts
 				} else if dropErr = a.Drop(ctx, h, filepath.Join(root, job), safeFiles); dropErr != nil {
 					row.Result, row.Reason = archive.Reason(dropErr)
 				} else {

@@ -1676,6 +1676,18 @@ func (a *Archiver) remove(ctx context.Context, p *Plan, res *Result, m *manifest
 	if len(retained) != 0 {
 		return res, nil
 	}
+	// Publishing a changed retention result can take long enough for a checkout
+	// to become dirty. Recheck immediately before deletion to preserve edits made
+	// during publication.
+	retained, err = a.checkoutSafety(ctx, p)
+	if err != nil {
+		return res, err
+	}
+	if len(retained) != 0 {
+		m.Retained = retained
+		res.Retained = retained
+		return res, nil
+	}
 	// p.Dir is absolute (Jobs), so it can never be read as an rm option and
 	// no "--" is needed.
 	if !path.IsAbs(p.Dir) {

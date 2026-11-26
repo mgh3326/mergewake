@@ -39,6 +39,22 @@ type mutateBeforeSnapshotWrite struct {
 	mutated     bool
 }
 
+type dirtyCheckoutOnManifestPublish struct {
+	reap.Runner
+	checkout string
+	dirtied  bool
+}
+
+func (r *dirtyCheckoutOnManifestPublish) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
+	if !r.dirtied && name == "sh" && len(args) > 1 && strings.Contains(args[1], `cat > "$1.partial"`) {
+		if err := os.WriteFile(filepath.Join(r.checkout, "tracked.txt"), []byte("edit during publish\n"), 0o644); err != nil {
+			return nil, err
+		}
+		r.dirtied = true
+	}
+	return r.Runner.Run(ctx, name, args, input, dir)
+}
+
 func (r *mutateBeforeSnapshotWrite) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
 	if !r.mutated && name == "sh" && len(args) > 1 && strings.Contains(args[1], `stage=$(mktemp -d`) {
 		if err := os.WriteFile(r.source, r.replacement, 0o644); err != nil {
@@ -469,6 +485,74 @@ func TestArchiveCheckoutSafetyControlsDeletion(t *testing.T) {
 				t.Fatalf("safe checkout result=%+v", res)
 			}
 		})
+	}
+}
+
+func TestArchiveRemoveScriptRemovesReadOnlyTree(t *testing.T) {
+	e := setup(t)
+	dir := job(t, e.jobs, "wk-remove-readonly")
+	write(t, filepath.Join(dir, "nested", "data"), "payload")
+	write(t, filepath.Join(dir, "report.md"), "report\n")
+	finishJob(t, dir)
+	if err := os.Chmod(filepath.Join(dir, "nested", "data"), 0o400); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(dir, "nested"), 0o500); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	a := archiver(e, "")
+	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, filepath.Base(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Apply(context.Background(), p, time.Now()); err != nil {
+		t.Fatalf("archive remove: %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("tree remains: %v", err)
+	}
+}
+
+func TestArchiveCheckoutEditDuringRetentionPublishKeepsSource(t *testing.T) {
+	e := setup(t)
+	dir := job(t, e.jobs, "wk-edit-during-publish")
+	write(t, filepath.Join(dir, "report.md"), "report\n")
+	write(t, filepath.Join(dir, "events", "00001-job.task_link.json"), `{"payload":{"task_id":2402}}`)
+	finishJob(t, dir)
+	checkout := filepath.Join(dir, "wt")
+	pushedCheckout(t, checkout)
+	a := archiver(e, "")
+	p, err := a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, filepath.Base(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Persist an unsafe retention result, then make the checkout clean so the
+	// next apply publishes the cleared retention state before removal.
+	write(t, filepath.Join(checkout, "tracked.txt"), "dirty before publish\n")
+	res, err := a.Apply(context.Background(), p, time.Now())
+	if err != nil || res.Deleted {
+		t.Fatalf("initial retained apply=%+v err=%v", res, err)
+	}
+	gitRun(t, checkout, "checkout", "--", "tracked.txt")
+	p, err = a.Plan(context.Background(), reap.Host{Name: "h1", Jobs: e.jobs}, filepath.Base(dir))
+	if err != nil || !p.Resume {
+		t.Fatalf("resume plan=%+v err=%v", p, err)
+	}
+	// Add another edit during publication. The final safety check must retain it.
+	runner := &dirtyCheckoutOnManifestPublish{Runner: e.run, checkout: checkout}
+	a.Runner = runner
+	res, err = a.Apply(context.Background(), p, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Deleted {
+		t.Fatal("source deleted after checkout became dirty during publish")
+	}
+	if got, err := os.ReadFile(filepath.Join(checkout, "tracked.txt")); err != nil || string(got) != "edit during publish\n" {
+		t.Fatalf("checkout edit=%q err=%v", got, err)
 	}
 }
 
