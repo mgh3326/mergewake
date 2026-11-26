@@ -286,15 +286,66 @@ func TestReapReviewerLegacyPathRescanUsesPerHostDrain(t *testing.T) {
 	if got := len(f.hub.ops("worktree.remove")); got != 1 {
 		t.Fatalf("first-pass removals=%d, want 1: %v", got, f.hub.ops("worktree.remove"))
 	}
-	var deferred *reapReceipt
-	for _, row := range f.rows(t) {
-		if row.Label == labels[1] && row.Worktree == "/work/"+labels[1] && row.Result == "pending-cleanup" && row.Reason == reviewerDrainHold {
-			copy := row
-			deferred = &copy
+	if rows := f.rows(t); len(rows) != 4 || rows[3].Result != "pending-cleanup" || rows[3].Reason != reviewerDrainHold || filepath.Base(rows[3].Worktree) != labels[1] {
+		t.Fatalf("the guarded legacy removal did not wait on the drain cap: %v", rowSummary(rows))
+	}
+}
+
+func TestReapReviewerAbsentLegacyPathsDoNotUsePerHostDrain(t *testing.T) {
+	f := newReviewerFix(t)
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	f.s.Config.Reap.ReviewerDrain = config.ReviewerDrain{PerHost: 1, HostOrder: []string{"node"}}
+	var initial []reapReceipt
+	for pr := 58; pr <= 60; pr++ {
+		label := reviewerLabelFor(pr, 3*24*time.Hour)
+		if pr == 60 {
+			f.hub.detached["/work/"+label] = true
+		}
+		initial = append(initial, reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: pr,
+			Host: "node-a", Label: label, Worktree: "/work/" + label + reviewerCheckoutSuffix,
+			Result: "skipped", Reason: reviewerAlreadyGone})
+	}
+	seedReapRows(t, f.s, testRepo.Name, initial...)
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	removes := f.hub.ops("worktree.remove")
+	want := "/work/" + reviewerLabelFor(60, 3*24*time.Hour)
+	if len(removes) != 1 || removes[0]["cwd"] != want {
+		t.Fatalf("removals=%v; absent legacy paths consumed the slot (rows %v)", removes, rowSummary(f.rows(t)))
+	}
+}
+
+func TestReapReviewerLegacyDryRunDoesNotUsePerHostDrain(t *testing.T) {
+	f := newReviewerFix(t)
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	f.s.Config.Reap.ReviewerDrain = config.ReviewerDrain{PerHost: 1, HostOrder: []string{"node"}}
+	want := map[string]bool{}
+	var initial []reapReceipt
+	for pr := 61; pr <= 62; pr++ {
+		label := reviewerLabelFor(pr, 3*24*time.Hour)
+		want[label] = true
+		f.hub.detached["/work/"+label] = true
+		initial = append(initial, reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: pr,
+			Host: "node-a", Label: label, Worktree: "/work/" + label + reviewerCheckoutSuffix,
+			Result: "skipped", Reason: reviewerAlreadyGone})
+	}
+	seedReapRows(t, f.s, testRepo.Name, initial...)
+	var out strings.Builder
+	f.s.Out = &out
+	if err := f.reap(t, 0, Options{DryRun: true}); err != nil {
+		t.Fatal(err)
+	}
+	for label := range want {
+		if !strings.Contains(out.String(), `"label":"`+label+`"`) || !strings.Contains(out.String(), `"worktree":"/work/`+label+`","result":"would-remove"`) {
+			t.Fatalf("dry run did not report legacy path %s as would-remove: %s", label, out.String())
 		}
 	}
-	if deferred == nil {
-		t.Fatalf("the capped rescan did not record its legacy source path: %v", rowSummary(f.rows(t)))
+	if strings.Contains(out.String(), reviewerDrainHold) {
+		t.Fatalf("dry run reported a drain hold: %s", out.String())
+	}
+	if got := len(f.hub.ops("worktree.remove")); got != 0 {
+		t.Fatalf("dry run removed worktrees: %v", f.hub.ops("worktree.remove"))
 	}
 }
 

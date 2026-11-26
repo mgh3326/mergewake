@@ -1655,7 +1655,6 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		return remoteStop
 	}
 	tree, e := hs.ops.Inspect(ctx, cwd)
-	drainTaken := false
 	// A suffix path is the current placement. If it is absent, try the
 	// pre-suffix work-root layout once. Preserve that path in the receipt so
 	// the source of this cleanup is visible and terminal rows stop repeating.
@@ -1669,13 +1668,6 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 			}
 			if reviewerWaiting(prior, w.now) {
 				return remoteStop
-			}
-			if w.oldPathRetry(l.name, hs.host.Name) {
-				if !w.takeDrain(hs.host.Name) {
-					w.record(rec, "pending-cleanup", reviewerDrainHold)
-					return remoteStop
-				}
-				drainTaken = true
 			}
 			if w.acting {
 				if e := hs.refreshPanes(ctx); e != nil {
@@ -1716,7 +1708,7 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 	}
 	// The drain cap bounds how many guarded removals one host takes in a pass;
 	// the rest waits with a row of their own, so the label stays a candidate.
-	if !drainTaken && !w.takeDrain(hs.host.Name) {
+	if !w.takeDrain(hs.host.Name) {
 		w.record(rec, "pending-cleanup", reviewerDrainHold)
 		return remoteStop
 	}
