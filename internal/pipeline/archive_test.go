@@ -2172,3 +2172,73 @@ func TestArchiveJobsDeadlineBeforeApplyCountsInterruptedAndRemainingJobs(t *test
 		t.Fatalf("pre-apply deadline did not count interrupted and remaining jobs: %s", out)
 	}
 }
+
+// archiveFailDeleteRunner fails the source delete without blocking, so the
+// first run leaves a published manifest behind for a later resume.
+type archiveFailDeleteRunner struct {
+	base integrations.Runner
+}
+
+func (r *archiveFailDeleteRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
+	if name == "sh" && strings.Contains(strings.Join(args, " "), `rm -rf "$1" || {`) {
+		return nil, errors.New("injected delete failure")
+	}
+	return r.base.Run(ctx, name, args, input, dir)
+}
+
+// A legacy manifest that names a retained checkout must not turn a resumed
+// delete into archived-retained: the job is deleted, so the row is archived.
+func TestArchiveJobsResumeDeleteLegacyRetainedRecordsArchived(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	jobDir(t, f.jobs, "old-job", 20*24*time.Hour)
+	f.s.Runner = &archiveFailDeleteRunner{base: f.run}
+	_ = f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{})
+	var manifestPath string
+	err := filepath.Walk(f.drive, func(p string, info os.FileInfo, err error) error {
+		if err == nil && info.Name() == "manifest.json" {
+			manifestPath = p
+		}
+		return err
+	})
+	if err != nil || manifestPath == "" {
+		t.Fatalf("no published manifest after failed delete: %v", err)
+	}
+	b, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	m["retained"] = []map[string]string{{"path": "wt", "class": "checkout-unsafe", "reason": "dirty"}}
+	b, err = json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f.s.Runner = f.run
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{}); err != nil {
+		t.Fatalf("resume run failed: %v", err)
+	}
+	rows, err := os.ReadFile(filepath.Join(f.s.Config.StateDir, "archive-jobs.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var last *archiveRow
+	for _, line := range strings.Split(strings.TrimSpace(string(rows)), "\n") {
+		var row archiveRow
+		if json.Unmarshal([]byte(line), &row) == nil && row.Action == "archive-job" && row.Job == "old-job" {
+			r := row
+			last = &r
+		}
+	}
+	if last == nil || last.Archive == nil || !last.Archive.Deleted {
+		t.Fatalf("resumed job was not deleted: %s", rows)
+	}
+	if last.Result != "archived" {
+		t.Fatalf("resumed deleted job recorded %q (%s), want archived", last.Result, last.Reason)
+	}
+}

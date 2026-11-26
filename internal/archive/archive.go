@@ -1800,6 +1800,9 @@ rm -rf "$1" || {
 		return res, fmt.Errorf("delete %s: %w", p.Dir, err)
 	}
 	res.Deleted = true
+	// A deleted job retains nothing under current policy. A legacy manifest may
+	// still list retained checkouts, so drop them here rather than report them.
+	res.Retained = nil
 	return res, nil
 }
 
