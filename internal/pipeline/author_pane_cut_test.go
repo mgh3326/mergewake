@@ -147,3 +147,35 @@ func TestBoundLaneKeepsCandidatesWhenCutHostIsSeen(t *testing.T) {
 		t.Fatalf("route lane %q finished %q ambiguous %v; want bound lane kept with candidates w-9, w-8", rt.lane, rt.finished, rt.ambiguous)
 	}
 }
+
+// A terminal bound job; host B's agent panes are all inspected, but a
+// non-agent pane's cwd times out, so B is failed with its pane list read. One
+// head-branch candidate on healthy host A. The bound lane stands, named
+// finished, and the candidate is kept.
+func TestBoundLaneFinishedKeptOnPartialScanWithCandidate(t *testing.T) {
+	hostA := reap.Host{Name: "local"}
+	hostB := reap.Host{Name: "node-b", SSH: "ops@node-b", Machine: "mb-b"}
+	agentB := aPane{"w1:p6", "w-6", "/wt/x", "other", projectOrigin}
+	s, sink, run := takeoverSetup(t, paneB)
+	s.Config.Hosts = []reap.Host{hostA, hostB}
+	sink.recs["w-7"] = integrations.JobRecord{State: "completed", Role: "worker", Label: "w-7", HubLane: "w-7-lane"}
+	for k, v := range hostPaneOuts(hostB, agentB) {
+		run.outs[k] = v
+	}
+	// The full pane list also holds a shell pane that is not an agent.
+	sshHerdr := func(args ...string) string {
+		return key("ssh", "-o", "BatchMode=yes", "-T", "-n", hostB.SSH, reap.Join(args))
+	}
+	run.outs[sshHerdr("herdr", "pane", "list")] = `{"result":{"panes":[{"pane_id":"w1:p6","cwd":"/wt/x"},{"pane_id":"w2:p9","cwd":"/wt/shell"}]}}`
+	for k, v := range sshGitOuts(hostB, authorHost(agentB).outs) {
+		run.outs[k] = v
+	}
+	run.errs = map[string]error{sshHerdr("git", "-C", "/wt/shell", "rev-parse", "--absolute-git-dir", "--git-common-dir", "--show-toplevel"): scanTimeout{}}
+	rt, e := s.findingsRoute(context.Background(), testRepoFor(s), s.GH.(*fakeGH).pull)
+	if e != nil {
+		t.Fatal(e)
+	}
+	if rt.lane != "w-7-lane" || rt.finished != "w-7-lane" || !slices.Equal(rt.ambiguous, []string{"w-9"}) {
+		t.Fatalf("route lane %q finished %q ambiguous %v; want bound lane kept, finished, candidates [w-9]", rt.lane, rt.finished, rt.ambiguous)
+	}
+}

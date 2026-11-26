@@ -397,7 +397,9 @@ type authorRoute struct {
 // the candidates for an audit row. A bound job that is terminal and that no
 // read host shows a pane for is finished: its lane is not returned (the caller
 // falls through to authorPane and the trailer), and the route names it in
-// finished so a delivery still on it can be rerouted. A host or job read error
+// finished so a delivery still on it can be rerouted. On a partial scan with
+// takeover candidates the bound lane is kept, never cleared, even when the job
+// is finished; it is named in finished too, so the reroute waits for a full scan. A host or job read error
 // is returned so the caller retries rather than picking a lane.
 func (s *Service) boundAuthorLane(ctx context.Context, r config.Repo, pr github.Pull, task string) (authorRoute, error) {
 	// One scan record for the whole route, so the hosts that failed are the
@@ -436,6 +438,9 @@ func (s *Service) boundAuthorLane(ctx context.Context, r config.Repo, pr github.
 	if len(bound.failedHosts) > 0 && len(others) > 0 {
 		bound.candidates = others
 		bound.unknown = unknown
+		if finished {
+			bound.finished = lane
+		}
 		return bound, nil
 	}
 	route, takenOver := bound, false
