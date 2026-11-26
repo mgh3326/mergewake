@@ -500,17 +500,24 @@ A single PR's fetch failure never aborts the pass.
 | `min_age` | `24h` | How long after reap first sights an ended job whose pane is gone its job dir is archived; also the `archive-jobs --older-than` default. Accepts Go durations and whole days (`14d`). |
 | `max_jobs_per_run` | `0` | Maximum jobs selected for archive or resume by one `archive-jobs` run; `0` means no limit. Dry-run and shadow use the same cap and selection as apply. Oldest jobs are taken first and the summary reports eligible jobs left. |
 | `exclude` | `['pw-rollout-*', 'pw-hk*', 'events-lane']` | Shell globs matched against job directory names and skipped before per-job host inspection. An explicit empty list disables exclusions; invalid globs are configuration errors. |
+| `cache_paths` | Built-in Go, Node, Python, and tool cache directories | Directory paths matched by complete path segments inside the job folder. Matching files are excluded from Drive and listed once per matched cache root with reason `cache` and a file count. An explicit empty list disables cache exclusions; entries must be relative directory paths ending in `/` (maximum 64, each at most 4096 bytes). |
+
+The built-in `cache_paths` are `pkg/mod/`, `go-build/`, `.gocache/`,
+`gocache/`, `node_modules/`, `.npm/`, `.pnpm-store/`, `.yarn/cache/`,
+`__pycache__/`, `.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`, `.tox/`,
+`.venv/`, `.cache/`, `.gradle/caches/`, `.m2/repository/`,
+`.cargo/registry/`, `.cargo/git/`, and `Library/Caches/`.
 
 A panewire job dir (`<jobs>/<job>` on a `hosts[]` entry) is archived as one
 unit. Directories containing a `.git` file or directory are named as
 `git-tracked` exclusions and none of their files are copied. The source job dir
-is deleted only when every nested checkout is verified clean and pushed at the
-delete boundary; otherwise the archive completes with result
-`archived-retained`, records each `retained: checkout-unsafe <dir> <reason>`,
-and keeps the whole source dir. Reasons are `dirty`, `stash`, `unpushed`, or
-`git-error`. A later run repeats the safety checks and deletes only after all
-checkouts pass. Ignored files do not make a checkout dirty. Archiving runs
-these steps in order:
+is deleted after a successful archive even when a nested checkout is dirty,
+has a stash or unpushed commits, or cannot be checked. Each such checkout's
+`git-tracked` exclusion records its state (`dirty`, `stash`, `unpushed`, or
+`git-error`) in the manifest and hk note. Ignored files do not make a checkout
+dirty. Cache roots configured by `cache_paths` are excluded by directory path
+segments and recorded once per root with reason `cache` and a file count.
+Archiving runs these steps in order:
 
 1. **Plan** (read-only): the jobs dir is resolved on its own host — a
    leading `~/` is expanded with that host's `$HOME`, since quoted paths
@@ -589,6 +596,8 @@ these steps in order:
    recorded or sent to hk. A directory containing a `.git` entry is excluded
    as one `git-tracked` entry with its file count. Credential paths, non-regular
    entries, AppleDouble files and oversized files retain their existing rules.
+   Cache paths from `reap.archive.cache_paths` are excluded as directory roots;
+   the built-in list is documented above and an explicit empty list disables it.
 5. **Record**: no file bytes are uploaded to hk. The Drive `manifest.json`
    keeps the existing fields and meanings (`job`, `host`, `task`, `source`,
    `files`, `total_bytes`, `oversized`, `excluded`, `skipped`, `appledouble`)
@@ -596,23 +605,18 @@ these steps in order:
    Reasons include `credential-path`, `git-tracked`, `secret-like:<pattern>`,
    `appledouble`, `oversized`, and `non-regular`. One hk note document per
    job (`archive/<task-id>/<job>`) contains counts, bytes, excluded names and
-   reasons, Drive path and manifest sha256. Unsafe checkouts add a
-   `retained` manifest entry and a matching `retained: checkout-unsafe <dir>
-   <reason>` line to the hk note and archive-job row. A short task comment names that
+   reasons, Drive path and manifest sha256. Unsafe checkouts record their state
+   on the corresponding `git-tracked` exclusion. A short task comment names that
    document and Drive path. Replays after the published manifest resume only
-   the delete and do not rewrite either hk record unless the final checkout
-   safety check changes the retained state.
+   the delete and do not rewrite either hk record.
 6. **Manifest**: after both hk records succeed, `manifest.json` is written
    beside the files as the final publication marker; a failed record leaves
    no manifest and the job is retried.
 7. **Delete**: the job dir is listed again and must be unchanged outside
    nested checkouts — a file added or modified since the plan was never
    archived, so the job is kept as `job-changed`, including oversized files.
-   Each checkout must also pass `git status --porcelain` (untracked files count,
-   ignored files do not), `git stash list`, and
-   `git rev-list --all --not --remotes`. Any command error or nonempty result
-   retains the entire source dir as `archived-retained`; otherwise it is
-   removed with `rm -rf`. If that first removal fails, owner write and search
+   Checkout state is read for the manifest, but does not block source deletion.
+   The job dir is removed with `rm -rf`. If that first removal fails, owner write and search
    permissions are restored on directories and regular files inside the job
    dir (without following symlinks), then removal is retried.
    Excluded credential and oversized files go with it; their names and sizes

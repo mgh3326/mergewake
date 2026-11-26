@@ -810,9 +810,12 @@ type Archive struct {
 	MaxJobsPerRun     int      `yaml:"max_jobs_per_run"`
 	MaxRun            string   `yaml:"max_run"`
 	Exclude           []string `yaml:"exclude"`
+	CachePaths        []string `yaml:"cache_paths"`
 }
 
 var DefaultArchiveExclude = []string{"pw-rollout-*", "pw-hk*", "events-lane"}
+
+var DefaultArchiveCachePaths = []string{"pkg/mod/", "go-build/", ".gocache/", "gocache/", "node_modules/", ".npm/", ".pnpm-store/", ".yarn/cache/", "__pycache__/", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/", ".tox/", ".venv/", ".cache/", ".gradle/caches/", ".m2/repository/", ".cargo/registry/", ".cargo/git/", "Library/Caches/"}
 
 // ArchiveTextCap bounds reap.archive.text_max_bytes below the runner's 4 MiB
 // output limit, since each text file is read back through it.
@@ -1688,6 +1691,17 @@ func validateArchive(a *Archive) error {
 			return fmt.Errorf("reap.archive.exclude: invalid glob %q: %w", pattern, err)
 		}
 	}
+	if a.CachePaths == nil {
+		a.CachePaths = append([]string(nil), DefaultArchiveCachePaths...)
+	}
+	if len(a.CachePaths) > 64 {
+		return errors.New("reap.archive.cache_paths holds more than 64 paths")
+	}
+	for _, p := range a.CachePaths {
+		if !validArchiveCachePath(p) {
+			return fmt.Errorf("reap.archive.cache_paths: invalid path %q", p)
+		}
+	}
 	if a.DriveMaxFileBytes < 0 {
 		return errors.New("reap.archive.drive_max_file_bytes must be non-negative")
 	}
@@ -1716,6 +1730,18 @@ func validateArchive(a *Archive) error {
 		return errors.New("reap.archive.drive_dir must be an absolute path; ~ expands only for a local archive host")
 	}
 	return nil
+}
+
+func validArchiveCachePath(p string) bool {
+	if p == "" || len(p) > 4096 || strings.HasPrefix(p, "/") || strings.HasPrefix(p, "-") || !strings.HasSuffix(p, "/") || strings.ContainsAny(p, "\\\x00\r\n*?[]") {
+		return false
+	}
+	for _, segment := range strings.Split(strings.TrimSuffix(p, "/"), "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // laneName and hostName bound the panewire lane and panewire host names
