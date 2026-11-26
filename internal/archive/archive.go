@@ -655,10 +655,14 @@ func (a *Archiver) existingManifest(ctx context.Context, p *Plan) (bool, error) 
 		return false, a.readFailure(path.Base(mpath), err)
 	}
 	var m manifest
-	if json.Unmarshal(raw, &m) != nil || !m.matches(p, a.CachePaths) {
+	if json.Unmarshal(raw, &m) != nil {
 		return false, &Skip{"drive-dir-exists"}
 	}
-	p.Resume, p.done, p.doneRaw = true, &m, raw
+	filtered, ok := m.matches(p, a.CachePaths)
+	if !ok {
+		return false, &Skip{"drive-dir-exists"}
+	}
+	p.Resume, p.done, p.doneRaw = true, filtered, raw
 	return true, nil
 }
 
@@ -978,10 +982,14 @@ func (a *Archiver) planListed(ctx context.Context, h reap.Host, job, dir string,
 			return nil, a.readFailure(path.Base(mpath), err)
 		}
 		var m manifest
-		if json.Unmarshal(raw, &m) != nil || !m.matches(p, a.CachePaths) {
+		if json.Unmarshal(raw, &m) != nil {
 			return nil, &Skip{"drive-dir-exists"}
 		}
-		p.Resume, p.done, p.doneRaw = true, &m, raw
+		filtered, ok := m.matches(p, a.CachePaths)
+		if !ok {
+			return nil, &Skip{"drive-dir-exists"}
+		}
+		p.Resume, p.done, p.doneRaw = true, filtered, raw
 	}
 	return p, nil
 }
@@ -1065,7 +1073,7 @@ func HostSkipReason(job HostJobSummary) (reason string, newest int64) {
 	return "", job.Newest
 }
 
-func (m *manifest) matches(p *Plan, cachePaths []string) bool {
+func (m *manifest) matches(p *Plan, cachePaths []string) (*manifest, bool) {
 	files := make([]File, 0, len(m.Files))
 	for _, f := range m.Files {
 		if !isCachePath(f.Path, cachePaths) {
@@ -1091,11 +1099,11 @@ func (m *manifest) matches(p *Plan, cachePaths []string) bool {
 		}
 	}
 	if m.Job != p.Job || m.Host != p.Host || m.Task != p.Task || len(files) != len(p.Move) || len(oversized) != len(p.Oversized) || !sameStrings(excluded, p.Excluded) || !sameStrings(skipped, p.Skipped) || !sameStrings(appleDouble, p.AppleDouble) {
-		return false
+		return nil, false
 	}
 	for i, f := range oversized {
 		if f.Path != p.Oversized[i].Path || f.Size != p.Oversized[i].Size || f.SHA256 == "" || f.SHA256 != p.oversizedHashes[f.Path] {
-			return false
+			return nil, false
 		}
 	}
 	size := map[string]int64{}
@@ -1104,10 +1112,20 @@ func (m *manifest) matches(p *Plan, cachePaths []string) bool {
 	}
 	for i, f := range files {
 		if f.Path != p.Move[i] || f.Size != size[f.Path] || len(f.SHA256) != 64 {
-			return false
+			return nil, false
 		}
 	}
-	return true
+	filtered := *m
+	filtered.Files = files
+	filtered.Oversized = oversized
+	filtered.Excluded = excluded
+	filtered.Skipped = skipped
+	filtered.AppleDouble = appleDouble
+	filtered.TotalBytes = 0
+	for _, f := range files {
+		filtered.TotalBytes += f.Size
+	}
+	return &filtered, true
 }
 
 func sameStrings(a, b []string) bool {
