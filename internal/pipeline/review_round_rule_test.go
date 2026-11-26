@@ -425,6 +425,89 @@ func TestDeliverSkipsRoundEscalationWhenCountIsUnverified(t *testing.T) {
 	}
 }
 
+func setCountReadFailure(g *roundRuleGH, head string, markerErr error) {
+	a, b := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	g.passes = map[string][]github.PassReceipt{
+		a: {{Pass: 1, Round: 1}},
+		b: {{Pass: 1, Round: 2}},
+		"3333333333333333333333333333333333333333": {{Pass: 1, Round: 3}},
+		"4444444444444444444444444444444444444444": {{Pass: 1, Round: 4}},
+		"5555555555555555555555555555555555555555": {{Pass: 1, Round: 5}},
+		"6666666666666666666666666666666666666666": {{Pass: 1, Round: 6}},
+		head: {{Pass: 1, Round: 7}},
+	}
+	g.pull.Head.SHA = head
+	g.refs[doneRef(7, head)] = true
+	g.parents2 = map[string][]string{b: {a, shaB}}
+	g.refs[doneRef(7, a)] = true
+	g.refs[doneRef(7, b)] = true
+	g.doneErr = map[string]error{a + "-done": markerErr}
+}
+
+func TestDeliverContinuesOwedLadderWorkWhenRoundCountReadFails(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		state roundRuleState
+		check func(*testing.T, *ackNotifier, *roundRuleRunner)
+	}{
+		{
+			name:  "ended decision",
+			state: roundRuleState{LadderEscalated: true, LadderEndedNoSuccessor: true},
+			check: func(t *testing.T, n *ackNotifier, run *roundRuleRunner) {
+				if !hasDecisionText(n, "ended without successor") {
+					t.Fatalf("owed ended decision not sent: %+v", n.events)
+				}
+				if calls, _, _ := escalateSnapshot(run); calls != 0 {
+					t.Fatalf("owed decision re-ran escalation %d times", calls)
+				}
+			},
+		},
+		{
+			name:  "refusal decision",
+			state: roundRuleState{LadderEscalated: true, LadderRefusalText: "preflight refused", LadderRefusalRound: 5},
+			check: func(t *testing.T, n *ackNotifier, run *roundRuleRunner) {
+				if !hasDecisionText(n, "refused") {
+					t.Fatalf("owed refusal decision not sent: %+v", n.events)
+				}
+				if calls, _, _ := escalateSnapshot(run); calls != 0 {
+					t.Fatalf("owed refusal re-ran escalation %d times", calls)
+				}
+			},
+		},
+		{
+			name:  "pending retry",
+			state: roundRuleState{LadderPendingSince: time.Date(2026, 11, 1, 9, 0, 0, 0, time.UTC)},
+			check: func(t *testing.T, n *ackNotifier, run *roundRuleRunner) {
+				if calls, _, _ := escalateSnapshot(run); calls != 1 {
+					t.Fatalf("pending ladder retry calls = %d, want 1", calls)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, g, n, _, run, r := roundRuleSetup(t, 7)
+			head := strings.Repeat("7", 40)
+			setCountReadFailure(g, head, errors.New("temporary GitHub failure"))
+			g.feedback = github.ReviewFeedback{HeadSHA: head, PRAuthor: "pr-author", ReviewAuthors: map[string]int{"review-bot": 1}, Threads: []github.ReviewThread{ownFinding("T1", "high", 10)}}
+			s.Runner = &mergeRunner{Runner: s.Runner, headTree: "tree-m", mergedTree: "tree-m"}
+			if err := s.saveRoundRuleState(r.Name, 7, tc.state); err != nil {
+				t.Fatal(err)
+			}
+			deliver(t, s, r)
+			tc.check(t, n, run)
+		})
+	}
+}
+
+func hasDecisionText(n *ackNotifier, text string) bool {
+	for _, event := range n.events {
+		if event.Type == "decision" && strings.Contains(event.Text, text) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestRoundRule_e_Round5HoldAndDecisionEvent(t *testing.T) {
 	s, g, n, _, _, r := roundRuleSetup(t, 7)
 	g.feedback.Threads = []github.ReviewThread{
