@@ -388,6 +388,7 @@ func TestResumeOldManifestCacheFilesAndRejectOtherDifferences(t *testing.T) {
 		dir := filepath.Join(e.jobs, "wk-resume-old-cache")
 		write(t, filepath.Join(dir, "report.md"), "report\n")
 		write(t, filepath.Join(dir, "node_modules/pkg/index.js"), "node\n")
+		write(t, filepath.Join(dir, ".venv/lib/excluded.txt"), "excluded\n")
 		write(t, filepath.Join(dir, ".gocache/build.bin"), "go cache\n")
 		write(t, filepath.Join(dir, "node_modules/js-tokens/index.js"), "credential-like\n")
 		write(t, filepath.Join(dir, "node_modules/._metadata"), "apple double\n")
@@ -405,6 +406,7 @@ func TestResumeOldManifestCacheFilesAndRejectOtherDifferences(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		fresh := &Plan{Files: p.Files, Bytes: p.Bytes, Excluded: append([]string(nil), p.Excluded...)}
 		e.run.failRm = true
 		if _, err := a.Apply(context.Background(), p, time.Now()); err == nil {
 			t.Fatal("expected simulated delete failure")
@@ -422,7 +424,7 @@ func TestResumeOldManifestCacheFilesAndRejectOtherDifferences(t *testing.T) {
 		for _, rel := range []string{"node_modules/pkg/index.js", ".gocache/build.bin"} {
 			m.Files = append(m.Files, File{Path: rel, Size: int64(len("legacy cache")), SHA256: strings.Repeat("a", 64)})
 		}
-		m.Excluded = append(m.Excluded, "node_modules/js-tokens/index.js")
+		m.Excluded = append(m.Excluded, ".venv/lib/excluded.txt")
 		m.Skipped = append(m.Skipped, "node_modules/.bin/tool")
 		m.AppleDouble = append(m.AppleDouble, "node_modules/._metadata")
 		m.Oversized = append(m.Oversized, File{Path: "node_modules/large.bin", Size: 9, SHA256: strings.Repeat("b", 64)})
@@ -440,6 +442,37 @@ func TestResumeOldManifestCacheFilesAndRejectOtherDifferences(t *testing.T) {
 		res, err := a.Apply(context.Background(), p, time.Now())
 		if err != nil || !res.Deleted {
 			t.Fatalf("resume apply=%+v err=%v", res, err)
+		}
+		if res.Files != fresh.Files || res.Bytes != fresh.Bytes || !sameStrings(res.Excluded, fresh.Excluded) {
+			t.Fatalf("resume result files/bytes/excluded = %d/%d/%v, fresh plan = %d/%d/%v", res.Files, res.Bytes, res.Excluded, fresh.Files, fresh.Bytes, fresh.Excluded)
+		}
+	})
+	t.Run("manifest without cache entries preserves result", func(t *testing.T) {
+		e := setup(t)
+		dir := job(t, e.jobs, "wk-resume-no-cache")
+		write(t, filepath.Join(dir, "report.md"), "report\n")
+		a := archiver(e, "")
+		h := reap.Host{Name: "h1", Jobs: e.jobs}
+		p, err := a.Plan(context.Background(), h, filepath.Base(dir))
+		if err != nil {
+			t.Fatal(err)
+		}
+		e.run.failRm = true
+		if _, err := a.Apply(context.Background(), p, time.Now()); err == nil {
+			t.Fatal("expected simulated delete failure")
+		}
+		e.run.failRm = false
+		want := &Result{Files: p.Files, Bytes: p.Bytes, Excluded: p.Excluded}
+		resumePlan, err := a.Plan(context.Background(), h, filepath.Base(dir))
+		if err != nil || !resumePlan.Resume {
+			t.Fatalf("manifest did not resume: plan=%+v err=%v", resumePlan, err)
+		}
+		got, err := a.Apply(context.Background(), resumePlan, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Files != want.Files || got.Bytes != want.Bytes || !sameStrings(got.Excluded, want.Excluded) {
+			t.Fatalf("resume result %+v differs from fresh result %+v", got, want)
 		}
 	})
 	for _, field := range []string{"excluded", "skipped", "appledouble", "oversized"} {
