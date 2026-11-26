@@ -17,7 +17,8 @@ import (
 const orphanWorktreeAction = "orphan-worktree"
 
 type orphanWorktreeCursor struct {
-	Hosts map[string]string `json:"hosts,omitempty"`
+	Hosts    map[string]string `json:"hosts,omitempty"`
+	NextHost string            `json:"next_host,omitempty"`
 	// Host and Path read cursors written by the first version.
 	Host string `json:"host,omitempty"`
 	Path string `json:"path,omitempty"`
@@ -77,10 +78,18 @@ func (s *Service) reapOrphanWorktrees(ctx context.Context, r config.Repo, hosts 
 	var errs []error
 	orderedHosts := append([]*reapHost(nil), hosts...)
 	sort.SliceStable(orderedHosts, func(i, j int) bool { return orderedHosts[i].host.Name < orderedHosts[j].host.Name })
+	if from.NextHost != "" && len(orderedHosts) > 1 {
+		start := sort.Search(len(orderedHosts), func(i int) bool { return orderedHosts[i].host.Name >= from.NextHost })
+		if start == len(orderedHosts) {
+			start = 0
+		}
+		orderedHosts = append(append([]*reapHost(nil), orderedHosts[start:]...), orderedHosts[:start]...)
+	}
 	visited := map[string]int{}
 	lastVisited := map[string]string{}
+	nextHost := from.NextHost
 	var budgetStopped bool
-	for _, hs := range orderedHosts {
+	for hostIndex, hs := range orderedHosts {
 		if err := reapBudgetCheck(ctx, "orphan worktree discovery"); err != nil {
 			errs = append(errs, err)
 			budgetStopped = true
@@ -94,6 +103,9 @@ func (s *Service) reapOrphanWorktrees(ctx context.Context, r config.Repo, hosts 
 		if hs.host.WorkRoot == "" || hs.failed {
 			continue
 		}
+		// Move discovery start before the potentially slow host listing. If
+		// this host consumes the stage share, the next pass starts at its peer.
+		nextHost = orderedHosts[(hostIndex+1)%len(orderedHosts)].host.Name
 		for _, kind := range []string{"exp", "detached", "branch", "worker-owned", "other"} {
 			counts[hs.host.Name+"\x00"+kind] = 0
 		}
@@ -294,19 +306,19 @@ func (s *Service) reapOrphanWorktrees(ctx context.Context, r config.Repo, hosts 
 			break
 		}
 	}
-	if durable && len(lastVisited) != 0 {
+	if durable && (len(lastVisited) != 0 || nextHost != from.NextHost || (!budgetStopped && len(lastVisited) == 0)) {
 		if from.Hosts == nil {
 			from.Hosts = map[string]string{}
 		}
 		for host, path := range lastVisited {
 			from.Hosts[host] = path
 		}
+		if !budgetStopped && len(lastVisited) == 0 {
+			from.Hosts = nil
+		}
+		from.NextHost = nextHost
 		from.Host, from.Path = "", ""
 		if e := s.saveOrphanWorktreeCursor(r.Name, from); e != nil {
-			errs = append(errs, e)
-		}
-	} else if durable && !budgetStopped {
-		if e := s.saveOrphanWorktreeCursor(r.Name, orphanWorktreeCursor{}); e != nil {
 			errs = append(errs, e)
 		}
 	}

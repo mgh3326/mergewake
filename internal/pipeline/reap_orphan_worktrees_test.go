@@ -291,6 +291,33 @@ func TestOrphanWorktreeInspectsBeforeSlowLaterHostListing(t *testing.T) {
 	}
 }
 
+func TestOrphanWorktreeDiscoveryRotatesPastSlowFirstHost(t *testing.T) {
+	a := newOrphanFixture(t, "wk/a", false)
+	b := newOrphanFixture(t, "wk/b", false)
+	a.hs.host.Name, b.hs.host.Name = "a", "b"
+	a.hs.host.WorkRoot, b.hs.host.WorkRoot = a.root, b.root
+	a.s.Config.Hosts = []reap.Host{a.hs.host, b.hs.host}
+	slow := &slowOrphanListRunner{}
+	a.hs.exec.Runner = slow
+	var laterHostInspected bool
+	for pass := 0; pass < 2; pass++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+		ctx = context.WithValue(ctx, reapBudgetKey{}, reapBudget{deadline: time.Now().Add(150 * time.Millisecond), passDeadline: time.Now().Add(150 * time.Millisecond)})
+		var rows []reapReceipt
+		_ = a.s.reapOrphanWorktrees(ctx, testRepo, []*reapHost{a.hs, b.hs}, false, true, func(r reapReceipt) { rows = append(rows, r) })
+		cancel()
+		if pass == 0 && len(rows) != 0 {
+			t.Fatalf("pass one unexpectedly inspected rows: %+v", rows)
+		}
+		if pass == 1 && len(rows) == 1 && rows[0].Host == "b" {
+			laterHostInspected = true
+		}
+	}
+	if slow.calls != 2 || !laterHostInspected {
+		t.Fatalf("slow listings=%d, later host inspected=%v", slow.calls, laterHostInspected)
+	}
+}
+
 func TestOrphanWorktreeDryRunDoesNotWriteCursor(t *testing.T) {
 	f := newOrphanFixture(t, "", false)
 	errs := f.s.reapOrphanWorktrees(context.Background(), testRepo, []*reapHost{f.hs}, false, false, func(reapReceipt) {})
