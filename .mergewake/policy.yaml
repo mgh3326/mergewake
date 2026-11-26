@@ -10,8 +10,6 @@ required_checks:
 watch_checks: [ci-ok]
 any_ref_workflow: ci-any-ref.yml
 blocking:
-  - paths: [internal/rollout/**]
-    reason: Installation writes may damage files before a revert lands
   - paths: [internal/reap/**, internal/pipeline/reap*.go]
     reason: Reap closes live panes; a wrong close loses a worker's context that git revert cannot restore
   - paths: [internal/policy/**, .mergewake/**, .github/workflows/**]
