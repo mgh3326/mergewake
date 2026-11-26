@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/fsutil"
@@ -243,6 +244,23 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 			if !settled {
 				return nil
 			}
+		}
+		// A head red that turns green inside its confirmation window was a
+		// flake. Hold with a distinct reason, naming no PR and reverting nothing.
+		// The hold still tells a person main was red.
+		_, found, e := s.readRedSeen(r.Name)
+		if e != nil {
+			return e
+		}
+		if found {
+			if !result.Shadow && !o.DryRun {
+				if e = s.clearRedSeen(r.Name); e != nil {
+					return e
+				}
+			}
+			result.Action = "hold"
+			result.Reason = "flaky: red did not hold on rerun"
+			return s.reportWatch(ctx, r, result, head+":flaky", o)
 		}
 		result.Action = "healthy"
 		if !o.DryRun {
@@ -480,6 +498,18 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 	if len(result.Candidates) != 1 || origin == nil {
 		result.Culprit = culprit
 		return hold("culprit is not a single identifiable merged PR")
+	}
+	// A head culprit has no later commit to corroborate its red. Its red is
+	// held for the confirmation window; a rerun that passes inside it settles
+	// the red as flaky, and the window's expiry confirms it as today.
+	if window := s.confirmWindow(); window > 0 {
+		held, e := s.confirmHeadRed(r, culprit, index == len(chain)-1, window, !result.Shadow && !o.DryRun)
+		if e != nil {
+			return e
+		}
+		if held {
+			return hold(fmt.Sprintf("main red on %s: culprit candidate #%d unconfirmed; rerun the failed jobs to settle it", strings.Join(bisectChecks, ", "), origin.Number))
+		}
 	}
 	if e = s.ObservePR(ctx, r, *origin, o); e != nil {
 		return e
@@ -868,4 +898,79 @@ func (s *Service) recoveryTrailers(ctx context.Context, r config.Repo, pr github
 		}
 	}
 	return strings.Join(lines, "\n"), nil
+}
+
+// redSeen is the durable marker for a head culprit whose red is inside its
+// confirmation window: the commit and when it was first seen red.
+type redSeen struct {
+	Culprit string    `json:"culprit"`
+	Since   time.Time `json:"since"`
+}
+
+// redSeenFile is per stream, as the checkpoint is, so a deploy red never
+// confirms or clears a main-stream red.
+func (s *watchStream) redSeenFile(repo string) string {
+	name := "red-seen.json"
+	if s.deploy {
+		name = "deploy-red-seen.json"
+	}
+	return filepath.Join(s.state(repo), name)
+}
+
+func (s *watchStream) readRedSeen(repo string) (redSeen, bool, error) {
+	var m redSeen
+	found, e := fsutil.ReadJSON(s.redSeenFile(repo), &m)
+	return m, found, e
+}
+
+func (s *watchStream) clearRedSeen(repo string) error {
+	if e := os.Remove(s.redSeenFile(repo)); e != nil && !os.IsNotExist(e) {
+		return e
+	}
+	return nil
+}
+
+// confirmWindow is how long a head culprit's red is held before it is named.
+// Zero disables the window, so a service whose config was never loaded (or an
+// operator who sets watch_confirm_window to 0) keeps today's single-pass result.
+func (s *Service) confirmWindow() time.Duration {
+	if s.Config.WatchConfirmWindow == "" {
+		return 0
+	}
+	d, e := config.Duration(s.Config.WatchConfirmWindow)
+	if e != nil {
+		return 0
+	}
+	return d
+}
+
+// confirmHeadRed reports whether culprit's red is still inside its confirmation
+// window, and so must be held. A head culprit records its first sighting on the
+// first pass and is confirmed once the window expires. A culprit with a later
+// red commit in the bracket is corroborated by it, so it is confirmed at once.
+func (s *watchStream) confirmHeadRed(r config.Repo, culprit string, headCulprit bool, window time.Duration, persist bool) (bool, error) {
+	m, found, e := s.readRedSeen(r.Name)
+	if e != nil {
+		return false, e
+	}
+	if !headCulprit {
+		if found && persist {
+			return false, s.clearRedSeen(r.Name)
+		}
+		return false, nil
+	}
+	now := s.Service.now()
+	if !found || m.Culprit != culprit {
+		if persist {
+			return true, fsutil.WriteJSON(s.redSeenFile(r.Name), redSeen{Culprit: culprit, Since: now})
+		}
+		return true, nil
+	}
+	if now.Sub(m.Since) < window {
+		return true, nil
+	}
+	if persist {
+		return false, s.clearRedSeen(r.Name)
+	}
+	return false, nil
 }

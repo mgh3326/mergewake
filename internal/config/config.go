@@ -995,23 +995,24 @@ func validateDiscord(d *Discord) error {
 }
 
 type Config struct {
-	Version      int         `yaml:"version"`
-	Daemon       Daemon      `yaml:"daemon"`
-	Discord      Discord     `yaml:"discord"`
-	Host         string      `yaml:"host"`
-	StateDir     string      `yaml:"state_dir"`
-	TokenEnv     string      `yaml:"token_env"`
-	GitHubApp    *GitHubApp  `yaml:"github_app"`
-	PollInterval string      `yaml:"poll_interval"`
-	WatchLimit   int         `yaml:"watch_limit"`
-	Repos        []Repo      `yaml:"repos"`
-	Hosts        []reap.Host `yaml:"hosts"`
-	Reap         Reap        `yaml:"reap"`
-	Review       Review      `yaml:"review"`
-	Outcomes     Outcomes    `yaml:"outcomes"`
-	Notifier     Notifier    `yaml:"notifier"`
-	Sink         Sink        `yaml:"sink"`
-	Liveness     Liveness    `yaml:"liveness"`
+	Version            int         `yaml:"version"`
+	Daemon             Daemon      `yaml:"daemon"`
+	Discord            Discord     `yaml:"discord"`
+	Host               string      `yaml:"host"`
+	StateDir           string      `yaml:"state_dir"`
+	TokenEnv           string      `yaml:"token_env"`
+	GitHubApp          *GitHubApp  `yaml:"github_app"`
+	PollInterval       string      `yaml:"poll_interval"`
+	WatchLimit         int         `yaml:"watch_limit"`
+	WatchConfirmWindow string      `yaml:"watch_confirm_window"`
+	Repos              []Repo      `yaml:"repos"`
+	Hosts              []reap.Host `yaml:"hosts"`
+	Reap               Reap        `yaml:"reap"`
+	Review             Review      `yaml:"review"`
+	Outcomes           Outcomes    `yaml:"outcomes"`
+	Notifier           Notifier    `yaml:"notifier"`
+	Sink               Sink        `yaml:"sink"`
+	Liveness           Liveness    `yaml:"liveness"`
 }
 
 func Decode(r io.Reader, v any) error {
@@ -1072,6 +1073,12 @@ func validateBasics(c *Config) error {
 	}
 	if c.WatchLimit < 2 || c.WatchLimit > 1000 {
 		return errors.New("watch_limit must be 2..1000")
+	}
+	if c.WatchConfirmWindow == "" {
+		c.WatchConfirmWindow = "30m"
+	}
+	if _, e = Duration(c.WatchConfirmWindow); e != nil {
+		return fmt.Errorf("watch_confirm_window: %w", e)
 	}
 	if _, e = Duration(c.PollInterval); e != nil {
 		return e
