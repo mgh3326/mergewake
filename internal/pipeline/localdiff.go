@@ -119,6 +119,193 @@ func (s *Service) localDiff(ctx context.Context, r config.Repo, pr github.Pull) 
 	return diffResult{text: text, source: "local", summarized: summarized}, nil
 }
 
+// baseChangesDropped checks only commits brought in by first-parent merges on
+// the PR branch. A commit counts when it added a line that survived to the
+// current merge base but not to the PR head. The work is bounded so an unusual
+// history fails closed instead of making the gate unbounded.
+func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr github.Pull) ([]string, error) {
+	root := config.Expand(r.Root)
+	if root == "" || s.Runner == nil || pr.Head.SHA == "" || pr.Base.SHA == "" {
+		return nil, errors.New("base-drop check lacks checkout, runner, or PR commits")
+	}
+	git := func(args ...string) (string, error) {
+		b, err := s.gitIn(ctx, root, args...)
+		return string(b), err
+	}
+	field := func(args ...string) (string, error) {
+		out, err := git(args...)
+		return strings.TrimSpace(out), err
+	}
+	if _, err := field("rev-parse", "--git-dir"); err != nil {
+		return nil, errors.New("repo root is not a git checkout")
+	}
+	fetch := pr
+	if fetch.Base.Ref == "" {
+		fetch.Base.Ref = pr.Base.SHA
+	}
+	if _, err := s.fetchPRHead(ctx, root, r.Name, fetch); err != nil {
+		return nil, fmt.Errorf("fetch PR refs: %w", err)
+	}
+	have := func(sha string) bool {
+		_, err := field("cat-file", "-e", sha+"^{commit}")
+		return err == nil
+	}
+	if !have(pr.Base.SHA) {
+		if _, err := field("fetch", "--no-tags", "origin", pr.Base.SHA); err != nil || !have(pr.Base.SHA) {
+			return nil, fmt.Errorf("base commit %s is not in the local checkout", pr.Base.SHA)
+		}
+	}
+	if !have(pr.Head.SHA) {
+		return nil, fmt.Errorf("head commit %s is not in the local checkout", pr.Head.SHA)
+	}
+	mergeBase, err := field("merge-base", pr.Base.SHA, pr.Head.SHA)
+	if err != nil || mergeBase == "" {
+		return nil, errors.New("base and head have no merge base")
+	}
+	mergesText, err := field("rev-list", "--first-parent", "--merges", mergeBase+".."+pr.Head.SHA)
+	if err != nil {
+		return nil, fmt.Errorf("list PR merges: %w", err)
+	}
+	merges := nonemptyLines(mergesText)
+	if len(merges) > baseDropMergeLimit {
+		return nil, fmt.Errorf("PR has more than %d first-parent merges", baseDropMergeLimit)
+	}
+	affected := map[string]bool{}
+	commitsSeen := map[string]bool{}
+	lineCount := 0
+	for _, merge := range merges {
+		parentsText, err := field("rev-list", "--parents", "-n", "1", merge)
+		if err != nil {
+			return nil, fmt.Errorf("read merge %s: %w", merge, err)
+		}
+		parents := strings.Fields(parentsText)
+		if len(parents) != 3 {
+			return nil, fmt.Errorf("merge %s does not have two parents", merge)
+		}
+		baseAncestor, err := field("merge-base", pr.Base.SHA, parents[2])
+		if err != nil {
+			return nil, fmt.Errorf("check merge %s second parent against base: %w", merge, err)
+		}
+		if baseAncestor != parents[2] {
+			continue
+		}
+		forkPoint, err := field("merge-base", parents[1], parents[2])
+		if err != nil || forkPoint == "" {
+			return nil, fmt.Errorf("find fork point for merge %s", merge)
+		}
+		introducedText, err := field("rev-list", parents[2], "^"+forkPoint)
+		if err != nil {
+			return nil, fmt.Errorf("list commits introduced by merge %s: %w", merge, err)
+		}
+		introduced := nonemptyLines(introducedText)
+		if len(introduced) > baseDropCommitLimit-len(commitsSeen) {
+			return nil, fmt.Errorf("base history exceeds %d commits", baseDropCommitLimit)
+		}
+		for _, commit := range introduced {
+			if commitsSeen[commit] {
+				continue
+			}
+			commitsSeen[commit] = true
+			parentText, err := field("rev-list", "--parents", "-n", "1", commit)
+			if err != nil {
+				return nil, fmt.Errorf("read base commit %s: %w", commit, err)
+			}
+			commitParents := strings.Fields(parentText)
+			args := []string{"diff-tree", "--no-commit-id", "--unified=0", "--no-ext-diff", "-r"}
+			if len(commitParents) == 1 {
+				args = append(args, "--root", commit)
+			} else {
+				args = append(args, commitParents[1], commit)
+			}
+			diff, err := git(args...)
+			if err != nil {
+				return nil, fmt.Errorf("read added lines for %s: %w", commit, err)
+			}
+			for _, line := range addedFileLines(diff) {
+				lineCount++
+				if lineCount > baseDropLineLimit {
+					return nil, fmt.Errorf("base history exceeds %d added lines", baseDropLineLimit)
+				}
+				atBase, err := fileHasLine(git, mergeBase, line.path, line.text)
+				if err != nil {
+					return nil, fmt.Errorf("read merge-base file %s: %w", line.path, err)
+				}
+				if !atBase {
+					continue
+				}
+				atHead, err := fileHasLine(git, pr.Head.SHA, line.path, line.text)
+				if err != nil {
+					return nil, fmt.Errorf("read PR file %s: %w", line.path, err)
+				}
+				if !atHead {
+					affected[commit] = true
+				}
+			}
+		}
+	}
+	var dropped []string
+	for commit := range affected {
+		dropped = append(dropped, commit)
+	}
+	slices.Sort(dropped)
+	return dropped, nil
+}
+
+const (
+	baseDropMergeLimit  = 64
+	baseDropCommitLimit = 1000
+	baseDropLineLimit   = 100000
+)
+
+type addedBaseLine struct{ path, text string }
+
+func nonemptyLines(text string) []string {
+	var lines []string
+	for _, line := range strings.Split(text, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+func addedFileLines(diff string) []addedBaseLine {
+	var result []addedBaseLine
+	path := ""
+	for _, line := range strings.Split(diff, "\n") {
+		if strings.HasPrefix(line, "+++ b/") {
+			path = strings.TrimPrefix(line, "+++ b/")
+			continue
+		}
+		if path != "" && strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++") {
+			result = append(result, addedBaseLine{path: path, text: strings.TrimPrefix(line, "+")})
+		}
+	}
+	return result
+}
+
+func fileHasLine(git func(...string) (string, error), revision, path, want string) (bool, error) {
+	text, err := git("show", revision+":"+path)
+	if err != nil {
+		// A missing path means the line is absent. Check the tree separately so
+		// a missing blob or other object error fails closed.
+		tree, treeErr := git("ls-tree", "-r", "--name-only", revision)
+		if treeErr != nil {
+			return false, treeErr
+		}
+		if !slices.Contains(strings.Split(strings.TrimSpace(tree), "\n"), path) {
+			return false, nil
+		}
+		return false, err
+	}
+	for _, line := range strings.Split(text, "\n") {
+		if line == want {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // boundDiff applies reviewDiffBudget to a GitHub API patch. A patch within the
 // budget is returned byte for byte with no summarized paths; a larger one is
 // summarized exactly as the local fallback summarizes its patch, so both paths

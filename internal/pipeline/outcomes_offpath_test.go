@@ -79,7 +79,7 @@ func TestLandDoesNotPublishOutcomes(t *testing.T) {
 	finalRow(t, s, r, 99)
 	reps := newHangingReps()
 	t.Cleanup(reps.unblock)
-	s.Runner = reps
+	s.Runner = noMergeGitRunner{next: reps}
 	var nudges int
 	s.OutcomesChanged = func() { nudges++ }
 	if err := returnsWithin(t, 3*time.Second, "Land", func() error { return s.Land(context.Background(), r, 7, Options{}) }); err != nil {

@@ -37,7 +37,7 @@ func hostScanLandSetup(t *testing.T, posted time.Time, sink *jobSink, panes ...a
 	g.findings = 1
 	s.Sink = sink
 	run := authorHost(panes...)
-	s.Runner = run
+	s.Runner = noMergeGitRunner{next: run}
 	setPartialAuthorScan(s, run)
 	return s, g, r
 }

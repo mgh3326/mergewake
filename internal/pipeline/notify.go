@@ -229,6 +229,10 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 			summary += " | " + text
 			identity += " | " + text
 		}
+		if detail := baseChangeDropNotice(v); detail != "" {
+			summary += " | " + detail
+			identity += " | " + detail
+		}
 	}
 	if n := len(v.Review.ChecksSkipped); v.State == "ready" && n > 0 {
 		summary += fmt.Sprintf(" | %d required check(s) skipped: %s", n, strings.Join(v.Review.ChecksSkipped, ", "))
@@ -269,6 +273,16 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		record.FailedHosts = authorScanFailures(ctx)
 	}
 	return s.audit(r.Name, "pr-notify", record, false)
+}
+
+func baseChangeDropNotice(v gateVerdict) string {
+	if len(v.BaseChangesDropped) > 0 {
+		return "dropped base commit(s): " + strings.Join(v.BaseChangesDropped, ", ") + "; restore them by re-merging origin/main and keeping both sides"
+	}
+	if slices.Contains(v.Reasons, "base_change_dropped:unknown") {
+		return "could not verify base changes; restore them by re-merging origin/main and keeping both sides"
+	}
+	return ""
 }
 
 // errNotifyDelivery marks a lane event the notifier refused. The first
@@ -847,7 +861,7 @@ func authorAction(summary string) bool {
 		if reason == "conflict" || strings.HasPrefix(reason, "review_missing (") {
 			return true
 		}
-		for _, prefix := range []string{"blocking_findings:", "finding_outside_diff:", "triage_unanswered:", "check_failed:", "check_cancelled:", "check_absent:"} {
+		for _, prefix := range []string{"blocking_findings:", "finding_outside_diff:", "triage_unanswered:", "check_failed:", "check_cancelled:", "check_absent:", "base_change_dropped:"} {
 			if strings.HasPrefix(reason, prefix) {
 				return true
 			}

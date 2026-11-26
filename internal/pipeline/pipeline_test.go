@@ -602,7 +602,62 @@ type fakeRunner struct {
 	recommend []string
 }
 
+// noMergeGitRunner gives gate tests with a scripted runner a valid, empty PR
+// merge history while forwarding all non-Git work to that runner.
+type noMergeGitRunner struct {
+	next interface {
+		Run(context.Context, string, []string, string, string) ([]byte, error)
+	}
+}
+
+func (r noMergeGitRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	if command == "git" {
+		gitArgs := args
+		if len(gitArgs) >= 2 && gitArgs[0] == "-C" {
+			gitArgs = gitArgs[2:]
+		}
+		switch {
+		case len(gitArgs) >= 2 && gitArgs[0] == "rev-parse" && gitArgs[1] == "--git-dir":
+			return []byte(".git\n"), nil
+		case len(gitArgs) > 0 && gitArgs[0] == "cat-file":
+			return nil, nil
+		case len(gitArgs) > 0 && gitArgs[0] == "fetch":
+			return nil, nil
+		case len(gitArgs) > 0 && gitArgs[0] == "merge-base":
+			if len(gitArgs) > 1 {
+				return []byte(gitArgs[1] + "\n"), nil
+			}
+		case len(gitArgs) > 0 && gitArgs[0] == "rev-list":
+			return nil, nil
+		}
+	}
+	return r.next.Run(ctx, command, args, input, dir)
+}
+
 func (r *fakeRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	// The ordinary gate fixture has no local Git history. Model a valid
+	// checkout with no first-parent merges; integration tests that need real Git
+	// wrap this runner in realGitRunner.
+	if command == "git" {
+		gitArgs := args
+		if len(gitArgs) >= 2 && gitArgs[0] == "-C" {
+			gitArgs = gitArgs[2:]
+		}
+		switch {
+		case len(gitArgs) >= 2 && gitArgs[0] == "rev-parse" && gitArgs[1] == "--git-dir":
+			return []byte(".git\n"), nil
+		case len(gitArgs) > 0 && gitArgs[0] == "cat-file":
+			return nil, nil
+		case len(gitArgs) > 0 && gitArgs[0] == "fetch":
+			return nil, nil
+		case len(gitArgs) > 0 && gitArgs[0] == "merge-base":
+			if len(gitArgs) > 1 {
+				return []byte(gitArgs[1] + "\n"), nil
+			}
+		case len(gitArgs) > 0 && gitArgs[0] == "rev-list":
+			return nil, nil
+		}
+	}
 	if r.pane != nil && (command == "git" || command == "panewire") {
 		if command == "panewire" && len(args) > 0 && args[0] == "spawn" {
 			b, err := os.ReadFile(arg(args, "-p"))

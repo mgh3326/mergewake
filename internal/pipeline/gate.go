@@ -23,7 +23,7 @@ import (
 // gateVerdict is the merge-gate outcome for one PR head. State is "ready",
 // "blocked" or "pending"; pending verdicts emit nothing and never merge.
 // Reasons use a closed vocabulary: check_failed:<name>, check_cancelled:<name>, check_absent:<name> (a required check
-// with no run or status on the head, once the head has had time to start it), threads_open:<n>,
+// with no run or status on the head, once the head has had time to start it), base_change_dropped:<n>, base_change_dropped:unknown, threads_open:<n>,
 // blocking_findings:<n>, triage_unanswered:<n>, finding_outside_diff:<n> (critical or high findings a pass listed in its review body because their
 // path or line is not in the diff), author_fixing, review_missing and conflict. The two graded reasons replace threads_open when the policy has a
 // review_gate.land: graded or the PR takes the fast lane.
@@ -49,6 +49,9 @@ type gateVerdict struct {
 	// BLOCKED notice only; they never feed a decision.
 	Holds     []holdingThread
 	PassClean bool
+	// BaseChangesDropped lists the base commit IDs whose added lines were
+	// present at the merge base and are absent from the PR head.
+	BaseChangesDropped []string
 }
 
 // gateEvidence is the part of a gate pass the PR status snapshot carries
@@ -532,6 +535,13 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 		// own head, post-merge CI checks the composed result, and the stale
 		// base is recorded for information.
 		v.Review.BaseBehind = true
+	}
+	dropped, dropErr := s.baseChangesDropped(ctx, r, pr)
+	if dropErr != nil {
+		v.Reasons = append(v.Reasons, "base_change_dropped:unknown")
+	} else if len(dropped) > 0 {
+		v.BaseChangesDropped = dropped
+		v.Reasons = append(v.Reasons, "base_change_dropped:"+strconv.Itoa(len(dropped)))
 	}
 	if conflicting(pr) {
 		v.Reasons = append(v.Reasons, "conflict")

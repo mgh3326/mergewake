@@ -75,7 +75,7 @@ func TestLandAuthorFixWait(t *testing.T) {
 						}
 						sink.recs[tc.pane] = integrations.JobRecord{State: state, Label: tc.pane + "-lane"}
 					}
-					s.Runner = authorHost(aPane{"w1:p1", tc.pane, "/wt/a", "feature", projectOrigin})
+					s.Runner = noMergeGitRunner{next: authorHost(aPane{"w1:p1", tc.pane, "/wt/a", "feature", projectOrigin})}
 					s.Config.Hosts = []reap.Host{{Name: "local"}}
 				}
 				s.Sink = sink
