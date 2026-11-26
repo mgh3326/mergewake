@@ -2981,3 +2981,53 @@ func TestArchiveLockReclaimReleaseAndNewClaimInterleave(t *testing.T) {
 		t.Fatal("two claimers acquired simultaneously after release and reclaim")
 	}
 }
+
+// A legacy manifest keeps a retained entry for a checkout that older versions
+// left in place. Once resume deletes the job, the Result must not report that
+// retention: the job is gone and current policy retains nothing.
+func TestResumeDeleteClearsLegacyRetainedEntries(t *testing.T) {
+	e := setup(t)
+	dir := job(t, e.jobs, "wk-resume-legacy-retained")
+	finishJob(t, dir)
+	checkout := filepath.Join(dir, "wt")
+	pushedCheckout(t, checkout)
+	a := archiver(e, "")
+	h := reap.Host{Name: "h1", Jobs: e.jobs}
+	p, err := a.Plan(context.Background(), h, filepath.Base(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.run.failRm = true
+	if _, err := a.Apply(context.Background(), p, time.Now()); err == nil {
+		t.Fatal("expected simulated delete failure")
+	}
+	e.run.failRm = false
+	manifestPath := filepath.Join(p.Dest, "manifest.json")
+	b, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m manifest
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	m.Retained = []Retention{{Path: "wt", Class: "checkout-unsafe", Reason: "dirty"}}
+	b, err = json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resumePlan, err := a.Plan(context.Background(), h, filepath.Base(dir))
+	if err != nil || !resumePlan.Resume {
+		t.Fatalf("legacy retained manifest did not resume: plan=%+v err=%v", resumePlan, err)
+	}
+	res, err := a.Apply(context.Background(), resumePlan, time.Now())
+	if err != nil || !res.Deleted {
+		t.Fatalf("resume apply=%+v err=%v", res, err)
+	}
+	if len(res.Retained) != 0 {
+		t.Fatalf("deleted resume still reports retention: %+v", res.Retained)
+	}
+}
