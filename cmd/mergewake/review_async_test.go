@@ -160,7 +160,7 @@ func asyncEngineFixture(t *testing.T, prs, parallel int) *asyncEngine {
 	ctx, cancel := context.WithCancel(context.Background())
 	sink := &reviewerSink{jobs: map[string]integrations.JobRecord{}}
 	runner := &asyncRunner{sink: sink, done: ctx.Done(), labels: map[int][]string{}}
-	f.s.Sink, f.s.Runner = sink, runner
+	f.s.Sink, f.s.Runner = sink, noMergeGitHistoryRunner{next: runner}
 	f.s.Config.Review.Timeout = "25m"
 	e := newPREngine(f.s, f.gh, pipeline.Options{}, []config.Repo{f.repo}, nil, nil, func(string, int) {})
 	tm := &timers{}

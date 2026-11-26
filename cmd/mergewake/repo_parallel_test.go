@@ -223,7 +223,7 @@ func newMultiRepo(t *testing.T, names []string, prs, parallel int) *multiRepo {
 	results := &paneResults{}
 	runner := &repoRunner{results: results, gates: map[string]chan struct{}{}, started: map[string]int{}, returned: map[string]int{}, changed: make(chan struct{}, 1)}
 	out := &bytes.Buffer{}
-	s := &pipeline.Service{Config: cfg, GH: gh, Runner: runner, Sink: resultSink{results: results}, Notifier: recordingNotifier{&eventLog{}}, Out: out}
+	s := &pipeline.Service{Config: cfg, GH: gh, Runner: noMergeGitHistoryRunner{next: runner}, Sink: resultSink{results: results}, Notifier: recordingNotifier{&eventLog{}}, Out: out}
 	return &multiRepo{s: s, gh: gh, runner: runner, hubs: hubs, router: router, out: out}
 }
 

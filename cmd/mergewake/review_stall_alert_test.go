@@ -199,7 +199,7 @@ func TestPendingReviewStallAlerts(t *testing.T) {
 	// The review deadline outlasts the stall window: the placed reviewer is
 	// still running when the wait is already past reviewStallAfter.
 	s.f.s.Config.Review.Timeout = "3h"
-	s.f.s.Runner = &quotaRunner{}
+	s.f.s.Runner = noMergeGitHistoryRunner{next: &quotaRunner{}}
 	s.f.s.Sink = &quotaSink{rec: integrations.JobRecord{State: "running", Host: "node-a", PaneID: "p1"}}
 	s.waited(t, s.clock.past(61*time.Minute))
 
