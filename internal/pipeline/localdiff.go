@@ -143,7 +143,14 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 		return strings.TrimSpace(out), err
 	}
 	if _, err := field("rev-parse", "--git-dir"); err != nil {
-		return nil, errors.New("repo root is not a git checkout")
+		return nil, fmt.Errorf("repo root is not a git checkout: %w", err)
+	}
+	shallow, err := field("rev-parse", "--is-shallow-repository")
+	if err != nil {
+		return nil, fmt.Errorf("check shallow repository: %w", err)
+	}
+	if shallow == "true" {
+		return nil, errors.New("base-drop check requires complete commit history; checkout is shallow")
 	}
 	fetch := pr
 	if fetch.Base.Ref == "" {
@@ -168,11 +175,6 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 	if err != nil || mergeBase == "" {
 		return nil, errors.New("base and head have no merge base")
 	}
-	mergeKey := baseDropCacheKey("merge", mergeBase, pr.Head.SHA)
-	if cached, ok := s.baseDrops[mergeKey]; ok {
-		s.cacheBaseDrop(inputKey, mergeKey, cached)
-		return slices.Clone(cached.commits), nil
-	}
 	mergesText, err := field("rev-list", "--first-parent", "--merges", mergeBase+".."+pr.Head.SHA)
 	if err != nil {
 		return nil, fmt.Errorf("list PR merges: %w", err)
@@ -184,7 +186,7 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 	affected := map[string]bool{}
 	commitsSeen := map[string]bool{}
 	lineCount := 0
-	fileCache := map[string]map[string]map[string]struct{}{}
+	fileCache := map[string]map[string]map[string]int{}
 	for _, merge := range merges {
 		parentsText, err := field("rev-list", "--parents", "-n", "1", merge)
 		if err != nil {
@@ -228,37 +230,40 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 				return nil, fmt.Errorf("read base commit %s: %w", commit, err)
 			}
 			commitParents := strings.Fields(parentText)
-			args := []string{"diff-tree", "--no-commit-id", "--unified=0", "--no-ext-diff", "-r"}
+			args := []string{"diff-tree", "--no-commit-id", "--no-ext-diff", "-r", "--name-only", "-z"}
 			if len(commitParents) == 1 {
 				args = append(args, "--root", commit)
 			} else {
 				args = append(args, commitParents[1], commit)
 			}
-			diff, err := git(args...)
+			pathsText, err := git(args...)
 			if err != nil {
-				return nil, fmt.Errorf("read added lines for %s: %w", commit, err)
+				return nil, fmt.Errorf("read changed paths for %s: %w", commit, err)
 			}
-			for _, line := range addedFileLines(diff) {
-				lineCount++
+			for _, path := range strings.Split(strings.TrimSuffix(pathsText, "\x00"), "\x00") {
+				if path == "" {
+					continue
+				}
+				atSecondParent, err := fileLineOriginCount(git, parents[2], path, commit, fileCache)
+				if err != nil {
+					return nil, fmt.Errorf("read second-parent line origins for %s: %w", path, err)
+				}
+				lineCount += atSecondParent
 				if lineCount > baseDropLineLimit {
 					return nil, fmt.Errorf("base history exceeds %d added lines", baseDropLineLimit)
 				}
-				atSecondParent, err := fileHasLineCached(git, parents[2], line.path, line.text, fileCache)
-				if err != nil {
-					return nil, fmt.Errorf("read second-parent file %s: %w", line.path, err)
-				}
-				if !atSecondParent {
+				if atSecondParent == 0 {
 					continue
 				}
-				mergePath := line.path
-				if renamed, ok := renames[line.path]; ok {
+				mergePath := path
+				if renamed, ok := renames[path]; ok {
 					mergePath = renamed
 				}
-				inMerge, err := fileHasLineCached(git, merge, mergePath, line.text, fileCache)
+				inMerge, err := fileLineOriginCount(git, merge, mergePath, commit, fileCache)
 				if err != nil {
-					return nil, fmt.Errorf("read merge file %s: %w", mergePath, err)
+					return nil, fmt.Errorf("read merge line origins for %s: %w", mergePath, err)
 				}
-				if !inMerge {
+				if inMerge < atSecondParent {
 					affected[commit] = true
 				}
 			}
@@ -269,24 +274,22 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 		dropped = append(dropped, commit)
 	}
 	slices.Sort(dropped)
-	result := baseDropResult{mergeBase: mergeBase, commits: slices.Clone(dropped)}
-	s.cacheBaseDrop(inputKey, mergeKey, result)
+	result := baseDropResult{commits: slices.Clone(dropped)}
+	s.cacheBaseDrop(inputKey, result)
 	return dropped, nil
 }
 
 type baseDropResult struct {
-	mergeBase string
-	commits   []string
+	commits []string
 }
 
 func baseDropCacheKey(kind, base, head string) string { return kind + "\x00" + base + "\x00" + head }
 
-func (s *Service) cacheBaseDrop(inputKey, mergeKey string, result baseDropResult) {
+func (s *Service) cacheBaseDrop(inputKey string, result baseDropResult) {
 	if s.baseDrops == nil {
 		s.baseDrops = make(map[string]baseDropResult)
 	}
 	s.baseDrops[inputKey] = result
-	s.baseDrops[mergeKey] = result
 }
 
 const (
@@ -294,8 +297,6 @@ const (
 	baseDropCommitLimit = 1000
 	baseDropLineLimit   = 100000
 )
-
-type addedBaseLine struct{ path, text string }
 
 func nonemptyLines(text string) []string {
 	var lines []string
@@ -305,21 +306,6 @@ func nonemptyLines(text string) []string {
 		}
 	}
 	return lines
-}
-
-func addedFileLines(diff string) []addedBaseLine {
-	var result []addedBaseLine
-	path := ""
-	for _, line := range strings.Split(diff, "\n") {
-		if strings.HasPrefix(line, "+++ b/") {
-			path = strings.TrimPrefix(line, "+++ b/")
-			continue
-		}
-		if path != "" && strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++") {
-			result = append(result, addedBaseLine{path: path, text: strings.TrimPrefix(line, "+")})
-		}
-	}
-	return result
 }
 
 func renamedPaths(status string) map[string]string {
@@ -341,44 +327,48 @@ func renamedPaths(status string) map[string]string {
 	return result
 }
 
-func fileHasLineCached(git func(...string) (string, error), revision, path, want string, cache map[string]map[string]map[string]struct{}) (bool, error) {
+func fileLineOriginCount(git func(...string) (string, error), revision, path, origin string, cache map[string]map[string]map[string]int) (int, error) {
 	byPath := cache[revision]
 	if byPath == nil {
-		byPath = map[string]map[string]struct{}{}
+		byPath = map[string]map[string]int{}
 		cache[revision] = byPath
 	}
-	lines, ok := byPath[path]
-	if !ok {
-		var err error
-		lines, err = fileLineSet(git, revision, path)
-		if err != nil {
-			return false, err
-		}
-		byPath[path] = lines
+	if counts, ok := byPath[path]; ok {
+		return counts[origin], nil
 	}
-	_, ok = lines[want]
-	return ok, nil
-}
-
-func fileLineSet(git func(...string) (string, error), revision, path string) (map[string]struct{}, error) {
-	text, err := git("show", revision+":"+path)
+	pathspec := ":(literal)" + path
+	text, err := git("blame", "--root", "--line-porcelain", revision, "--", path)
 	if err != nil {
-		// A missing path means the line is absent. Check the tree separately so
-		// a missing blob or other object error fails closed.
-		tree, treeErr := git("ls-tree", "-r", "--name-only", revision)
+		// A missing path has no blamed lines. Query one literal path so a
+		// missing blob or other object error still fails closed.
+		tree, treeErr := git("ls-tree", "-r", "--name-only", "-z", revision, "--", pathspec)
 		if treeErr != nil {
-			return nil, treeErr
+			return 0, treeErr
 		}
-		if !slices.Contains(strings.Split(strings.TrimSpace(tree), "\n"), path) {
-			return map[string]struct{}{}, nil
+		if len(tree) == 0 {
+			byPath[path] = map[string]int{}
+			return 0, nil
 		}
-		return nil, err
+		return 0, err
 	}
-	lines := make(map[string]struct{})
+	if len(text) >= 4<<20 {
+		return 0, fmt.Errorf("base-drop blame for %s exceeds runner output limit", path)
+	}
+	counts := map[string]int{}
 	for _, line := range strings.Split(text, "\n") {
-		lines[line] = struct{}{}
+		fields := strings.Fields(line)
+		if len(fields) >= 3 && len(fields) <= 4 && len(fields[0]) >= 40 {
+			if _, err := strconv.Atoi(fields[1]); err != nil {
+				continue
+			}
+			if _, err := strconv.Atoi(fields[2]); err != nil {
+				continue
+			}
+			counts[strings.TrimPrefix(fields[0], "^")]++
+		}
 	}
-	return lines, nil
+	byPath[path] = counts
+	return counts[origin], nil
 }
 
 // boundDiff applies reviewDiffBudget to a GitHub API patch. A patch within the

@@ -118,6 +118,17 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		}
 		return e
 	}
+	var baseDropSince time.Time
+	if o.Reporting() {
+		if slices.Contains(v.Reasons, "base_change_dropped:unknown") {
+			baseDropSince, e = s.baseDropWaitSince(r, pr)
+		} else {
+			e = s.clearBaseDropWait(r, pr)
+		}
+		if e != nil {
+			return e
+		}
+	}
 	if o.Reporting() {
 		if e := notifyStep(ctx, "stalls", func() error { return s.notifyPRStalls(ctx, r, pr, p) }); e != nil {
 			if err := s.stallClockError(ctx, r, pr, prCheckRedCause, e); err != nil {
@@ -152,7 +163,8 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		Deduped         bool     `json:"deduped,omitempty"`
 		Suppressed      string   `json:"suppressed,omitempty"`
 		Error           string   `json:"error,omitempty"`
-	}{PR: n, Head: pr.Head.SHA, State: v.State, Reasons: v.Reasons, ChecksCancelled: v.Review.ChecksCancelled, ChecksSkipped: v.Review.ChecksSkipped, ReviewBlock: v.Review.Block, BaseBehind: v.Review.BaseBehind}
+		BaseDropError   string   `json:"base_drop_error,omitempty"`
+	}{PR: n, Head: pr.Head.SHA, State: v.State, Reasons: v.Reasons, ChecksCancelled: v.Review.ChecksCancelled, ChecksSkipped: v.Review.ChecksSkipped, ReviewBlock: v.Review.Block, BaseBehind: v.Review.BaseBehind, BaseDropError: v.BaseDropError}
 	if !o.Reporting() {
 		return s.audit(r.Name, "pr-notify", record, o.DryRun)
 	}
@@ -176,11 +188,27 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		conflicted = slices.Contains(reasons, "conflict")
 		reasons = slices.DeleteFunc(slices.Clone(reasons), func(reason string) bool { return reason == "conflict" })
 		if waiting {
-			since, e := s.reviewWaitSince(r, pr)
-			if e != nil {
-				return e
+			if slices.Contains(v.Reasons, "base_change_dropped:unknown") {
+				lane, via, sent, e := s.baseDropStalled(ctx, r, pr, v.BaseDropError, baseDropSince)
+				if e != nil {
+					if !errors.Is(e, errNotifyDelivery) {
+						return e
+					}
+					record.Via, record.Error = "delivery-failed", e.Error()
+					return s.audit(r.Name, "pr-notify", record, false)
+				}
+				if sent {
+					record.Reasons, record.Lane, record.Via, record.Sent = []string{"base_change_dropped:unknown"}, lane, via, true
+				}
 			}
 			if len(reasons) == 0 && !conflicted {
+				if slices.Contains(v.Reasons, "base_change_dropped:unknown") {
+					return s.audit(r.Name, "pr-notify", record, false)
+				}
+				since, e := s.reviewWaitSince(r, pr)
+				if e != nil {
+					return e
+				}
 				// Only mergewake's own queue holds the head: nothing for any
 				// session to do until the wait outlasts reviewStallAfter.
 				end := notifyStart(ctx, "review_stalled")
@@ -229,7 +257,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 			summary += " | " + text
 			identity += " | " + text
 		}
-		if detail := baseChangeDropNotice(v); detail != "" {
+		if detail := baseChangeDropNotice(v, r.Branch); detail != "" {
 			summary += " | " + detail
 			identity += " | " + detail
 		}
@@ -275,12 +303,25 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	return s.audit(r.Name, "pr-notify", record, false)
 }
 
-func baseChangeDropNotice(v gateVerdict) string {
-	if len(v.BaseChangesDropped) > 0 {
-		return "dropped base commit(s): " + strings.Join(v.BaseChangesDropped, ", ") + "; restore them by re-merging origin/main and keeping both sides"
+func baseChangeDropNotice(v gateVerdict, branches ...string) string {
+	branch := "main"
+	if len(branches) > 0 {
+		branch = branches[0]
 	}
-	if slices.Contains(v.Reasons, "base_change_dropped:unknown") {
-		return "could not verify base changes; restore them by re-merging origin/main and keeping both sides"
+	if branch == "" {
+		branch = "main"
+	}
+	if len(v.BaseChangesDropped) > 0 {
+		shown := v.BaseChangesDropped
+		extra := len(shown) - 5
+		if extra > 0 {
+			shown = shown[:5]
+		}
+		detail := "dropped base commit(s): " + strings.Join(shown, ", ")
+		if extra > 0 {
+			detail += fmt.Sprintf(" and %d more", extra)
+		}
+		return detail + "; ask the desk to rebuild the faulty merge from origin/" + branch + " while preserving PR changes after review"
 	}
 	return ""
 }
@@ -858,6 +899,9 @@ func (s *Service) notifyLane(ctx context.Context, r config.Repo, pr github.Pull)
 // detail only the author can add (NotifyPR renders it "review_missing (detail)").
 func authorAction(summary string) bool {
 	for _, reason := range strings.Split(summary, "; ") {
+		if reason == "base_change_dropped:unknown" {
+			continue
+		}
 		if reason == "conflict" || strings.HasPrefix(reason, "review_missing (") {
 			return true
 		}

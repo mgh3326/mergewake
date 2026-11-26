@@ -220,6 +220,10 @@ const reviewStallAfter = 60 * time.Minute
 // author's to fix or needs a human decision, and is sent.
 func splitInternalWaits(reasons []string, block string) (acted []string, waiting bool) {
 	for _, reason := range reasons {
+		if reason == "base_change_dropped:unknown" {
+			waiting = true
+			continue
+		}
 		if reason == "review_missing" && block == "" {
 			waiting = true
 			continue
@@ -236,6 +240,50 @@ type reviewWait struct {
 
 func (s *Service) reviewWaitsFile(repo string) string {
 	return filepath.Join(s.state(repo), "pr-review-wait.json")
+}
+
+func (s *Service) baseDropWaitsFile(repo string) string {
+	return filepath.Join(s.state(repo), "pr-base-drop-wait.json")
+}
+
+func (s *Service) baseDropWaitSince(r config.Repo, pr github.Pull) (time.Time, error) {
+	file := s.baseDropWaitsFile(r.Name)
+	defer lockPath(file)()
+	waits := map[string]reviewWait{}
+	if found, err := fsutil.ReadJSON(file, &waits); found && err != nil {
+		return time.Time{}, fmt.Errorf("%s: %w", file, err)
+	} else if err != nil {
+		return time.Time{}, err
+	}
+	now := s.now().UTC()
+	key := fmt.Sprintf("%d %s", pr.Number, pr.Head.SHA)
+	if wait, ok := waits[key]; ok {
+		return wait.First, nil
+	}
+	for other, wait := range waits {
+		if wait.First.Before(now.Add(-7 * 24 * time.Hour)) {
+			delete(waits, other)
+		}
+	}
+	waits[key] = reviewWait{First: now}
+	return now, fsutil.WriteJSON(file, waits)
+}
+
+func (s *Service) clearBaseDropWait(r config.Repo, pr github.Pull) error {
+	file := s.baseDropWaitsFile(r.Name)
+	defer lockPath(file)()
+	waits := map[string]reviewWait{}
+	if found, err := fsutil.ReadJSON(file, &waits); found && err != nil {
+		return fmt.Errorf("%s: %w", file, err)
+	} else if err != nil {
+		return err
+	}
+	key := fmt.Sprintf("%d %s", pr.Number, pr.Head.SHA)
+	if _, ok := waits[key]; !ok {
+		return nil
+	}
+	delete(waits, key)
+	return fsutil.WriteJSON(file, waits)
 }
 
 // reviewWaitSince returns when this (PR, head) was first seen with an
@@ -373,6 +421,41 @@ func (s *Service) reviewStalled(ctx context.Context, r config.Repo, pr github.Pu
 	}
 	if e = sent.add(key); e != nil {
 		return "", "", false, e
+	}
+	return lane, via, true, nil
+}
+
+func (s *Service) baseDropStalled(ctx context.Context, r config.Repo, pr github.Pull, detail string, since time.Time) (string, string, bool, error) {
+	waited := s.now().Sub(since)
+	if waited <= reviewStallAfter {
+		return "", "", false, nil
+	}
+	sent, err := loadSentKeys(filepath.Join(s.state(r.Name), "pr-notify-sent"), 255)
+	if err != nil {
+		return "", "", false, err
+	}
+	key := fmt.Sprintf("base-drop-stalled %d %s %d", pr.Number, pr.Head.SHA, since.UnixNano())
+	if sent.has(key) {
+		return "", "", false, nil
+	}
+	lane, via := s.ownerLane(r), "owner lane"
+	if detail == "" {
+		detail = "verification failed"
+	}
+	if len(detail) > 300 {
+		detail = detail[:300]
+	}
+	text := fmt.Sprintf("[mergewake] STALLED %s#%d head=%s | internal base-change verification failed for %s: %s | lane=%s via %s", r.Name, pr.Number, short7(pr.Head.SHA), waited.Round(time.Minute), detail, lane, via)
+	reportCtx, cancel := reportContext(ctx)
+	defer cancel()
+	if err = s.Notifier.Notify(reportCtx, integrations.Event{ID: fmt.Sprintf("mergewake-base-drop-stalled-%s-%d-%s-%d", r.Name, pr.Number, pr.Head.SHA, since.UnixNano()), Text: text, Lane: lane, Type: eventType("blocked")}); err != nil {
+		return "", "", false, fmt.Errorf("%w: %s", errNotifyDelivery, integrations.Detail(err))
+	}
+	if err = sent.add(key); err != nil {
+		return "", "", false, err
+	}
+	if err = s.audit(r.Name, "pr-notify", map[string]any{"pr": pr.Number, "head": pr.Head.SHA, "state": "stalled", "cause": "base_change_verification", "lane": lane, "via": via, "sent": true}, false); err != nil {
+		return "", "", false, err
 	}
 	return lane, via, true, nil
 }

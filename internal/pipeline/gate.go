@@ -52,6 +52,7 @@ type gateVerdict struct {
 	// BaseChangesDropped lists the base commit IDs whose added lines were
 	// present at the merge base and are absent from the PR head.
 	BaseChangesDropped []string
+	BaseDropError      string
 }
 
 // gateEvidence is the part of a gate pass the PR status snapshot carries
@@ -538,6 +539,10 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 	}
 	dropped, dropErr := s.baseChangesDropped(ctx, r, pr)
 	if dropErr != nil {
+		v.BaseDropError = integrations.Detail(dropErr)
+		if s.Log != nil {
+			s.Log.Warn("base-drop verification failed", "repo", r.Name, "pr", pr.Number, "head", pr.Head.SHA, "error", v.BaseDropError)
+		}
 		v.Reasons = append(v.Reasons, "base_change_dropped:unknown")
 	} else if len(dropped) > 0 {
 		v.BaseChangesDropped = dropped

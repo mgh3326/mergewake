@@ -252,9 +252,10 @@ func (s *Service) Land(ctx context.Context, r config.Repo, n int, o Options) (re
 		SameFamily bool   `json:"same_family,omitempty"`
 		// Review is the patch id, the review rounds and how the findings
 		// stand, so `land --dry-run` shows why a head is or is not ready.
-		Review reviewRecord `json:"review"`
+		Review        reviewRecord `json:"review"`
+		BaseDropError string       `json:"base_drop_error,omitempty"`
 		policy.Decision
-	}{n, pr.Head.SHA, head, v.State, v.SameFamily, v.Review, d}, o.DryRun); e != nil {
+	}{n, pr.Head.SHA, head, v.State, v.SameFamily, v.Review, v.BaseDropError, d}, o.DryRun); e != nil {
 		return e
 	}
 	if e = s.recordDecision(r.Name, n, d.Action, d.Shadow, v.SameFamily, o.DryRun); e != nil {
