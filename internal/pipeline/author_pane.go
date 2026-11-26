@@ -433,7 +433,7 @@ func (s *Service) boundAuthorLane(ctx context.Context, r config.Repo, pr github.
 	// A partial scan cannot establish that one observed pane is the unique
 	// takeover candidate. Keep the bound author lane and report every observed
 	// candidate in the partial-route audit.
-	if len(bound.failedHosts) > 0 && len(others) > 0 && !finished {
+	if len(bound.failedHosts) > 0 && len(others) > 0 {
 		bound.candidates = others
 		bound.unknown = unknown
 		return bound, nil
@@ -471,11 +471,11 @@ func (s *Service) boundAuthorLane(ctx context.Context, r config.Repo, pr github.
 // on the configured hosts. finished is true only when every host was read and
 // none shows a pane named for the job, its label, or its recorded pane id —
 // the pane id counting only on the host the record names, since a pane id is
-// local to its host. A host that failed after its pane list was read still
-// answers for the names it holds. unknown is set for a terminal job whose
-// hosts' pane lists were not all read, or with no hosts configured: liveness
-// is then unknown and the bound lane stands. A job that is not terminal is
-// never finished.
+// local to its host. A match on a host that failed after its pane list was
+// read still proves the job live. Otherwise a failed host that has an agent
+// pane whose cwd was never inspected, or a host whose pane list was not read,
+// makes liveness unknown: the bound lane stands. Also unknown with no hosts
+// configured. A job that is not terminal is never finished.
 func (s *Service) authorFinished(ctx context.Context, job string, rec integrations.JobRecord) (finished, unknown bool, err error) {
 	if !terminalJob(rec.State) {
 		return false, false, nil
@@ -498,18 +498,28 @@ func (s *Service) authorFinished(ctx context.Context, job string, rec integratio
 			break
 		}
 	}
+	// A match on any host proves the job live, whatever else was cut. Without
+	// one, finished needs every host's pane list read and every agent pane of
+	// a failed host inspected: a pane whose cwd was never inspected could be
+	// the job's own takeover.
+	cut := false
 	for _, hs := range hosts {
 		if hs.failed && !hs.panesRead {
-			return false, true, nil
+			cut = true
 		}
 		paneID := rec.PaneID != "" && (!placed || authorHostNamed(rec.Host, hs.host))
 		for _, p := range hs.panes {
 			if p.Name == job || (rec.Label != "" && p.Name == rec.Label) || (paneID && p.ID == rec.PaneID) {
 				return false, false, nil
 			}
+			if hs.failed && p.Cwd != "" {
+				if _, ok := hs.trees[p.Cwd]; !ok {
+					cut = true
+				}
+			}
 		}
 	}
-	if len(hosts) < len(s.Config.Hosts) {
+	if cut || len(hosts) < len(s.Config.Hosts) {
 		return false, true, nil
 	}
 	return true, false, nil
