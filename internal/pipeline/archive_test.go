@@ -1714,7 +1714,7 @@ func TestArchiveJobsBacklog(t *testing.T) {
 	}
 }
 
-func TestArchiveJobsRecordsUnsafeCheckoutAsRetained(t *testing.T) {
+func TestArchiveJobsDeletesUnsafeNestedCheckout(t *testing.T) {
 	f := newArchiveFixture(t, noAgents)
 	dir := jobDir(t, f.jobs, "unsafe-checkout", 20*24*time.Hour)
 	if err := os.RemoveAll(filepath.Join(dir, "events")); err != nil {
@@ -1726,15 +1726,15 @@ func TestArchiveJobsRecordsUnsafeCheckoutAsRetained(t *testing.T) {
 	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(dir); err != nil {
-		t.Fatalf("unsafe source was removed: %v", err)
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("unsafe source remains: %v", err)
 	}
 	log, err := os.ReadFile(filepath.Join(f.s.Config.StateDir, "archive-jobs.jsonl"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(log), `"result":"archived-retained"`) || !strings.Contains(string(log), `retained: checkout-unsafe wt git-error`) {
-		t.Fatalf("retention row missing: %s", log)
+	if !strings.Contains(string(log), `"result":"archived"`) || !strings.Contains(string(log), `"deleted":true`) {
+		t.Fatalf("archive completion row missing: %s", log)
 	}
 }
 
@@ -1908,9 +1908,8 @@ func TestReapArchiveErrorCountedOnce(t *testing.T) {
 	}
 }
 
-// A retained archive is re-attempted after the hour, and each attempt is
-// recorded: the retry row is appended even though the outcome repeats.
-func TestReapArchiveRetainedRetryAppendsRow(t *testing.T) {
+// An unsafe nested checkout is archived and deleted after the sighting ages.
+func TestReapArchiveUnsafeNestedCheckoutDeleted(t *testing.T) {
 	f := newArchiveFixture(t, noAgents)
 	dir := jobDir(t, f.jobs, "wk-7", 48*time.Hour)
 	if err := os.RemoveAll(filepath.Join(dir, "events")); err != nil {
@@ -1926,24 +1925,23 @@ func TestReapArchiveRetainedRetryAppendsRow(t *testing.T) {
 	if rows := f.rows(t); len(rows) != 1 || rows[0].Reason != "awaiting-min-age" {
 		t.Fatalf("rows = %+v", rows)
 	}
-	// Once the sighting ages out the archive runs and is retained.
+	// Once the sighting ages out the archive runs and deletes the source.
 	f.s.Now = func() time.Time { return time.Now().Add(48 * time.Hour) }
 	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if rows := f.rows(t); len(rows) != 2 || rows[1].Result != "archived-retained" {
+	if rows := f.rows(t); len(rows) != 2 || rows[1].Result != "archived" {
 		t.Fatalf("rows = %+v", rows)
 	}
-	// Past the retry hour the attempt is recorded again, not deduped away.
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("unsafe source remains: %v", err)
+	}
 	f.s.Now = func() time.Time { return time.Now().Add(50 * time.Hour) }
 	if err := f.s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
-	if rows := f.rows(t); len(rows) != 3 || rows[2].Result != "archived-retained" {
-		t.Fatalf("retry did not re-attempt the archive: %+v", rows)
-	}
-	if _, err := os.Stat(dir); err != nil {
-		t.Fatal("retained source removed")
+	if rows := f.rows(t); len(rows) != 2 {
+		t.Fatalf("deleted job was reconsidered: %+v", rows)
 	}
 }
 
