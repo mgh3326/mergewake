@@ -301,6 +301,86 @@ func TestArchiveJobsDropDryRunKeepsJob(t *testing.T) {
 	}
 }
 
+func TestArchiveJobsDropAgeGateAfterRefresh(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	dir := jobDir(t, f.jobs, "reviewer-old", 20*24*time.Hour)
+	f.s.Config.Reap.Archive.Drop = []config.ArchiveDrop{{Host: "local", Glob: "reviewer-*"}}
+	f.s.Runner = &archiveDropUncertainRunner{base: f.run, dir: dir}
+	if err := f.s.ArchiveJobs(context.Background(), "", 24*time.Hour, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("fresh job was dropped: %v", err)
+	}
+	if !strings.Contains(f.out.String(), `"reason":"too-new"`) {
+		t.Fatalf("missing too-new row: %s", f.out.String())
+	}
+}
+
+type archiveDropUncertainRunner struct {
+	base integrations.Runner
+	dir  string
+	once sync.Once
+}
+
+func (r *archiveDropUncertainRunner) Run(ctx context.Context, name string, args []string, input, dir string) ([]byte, error) {
+	if name == "sh" && len(args) > 1 && strings.Contains(args[1], "for d in *; do") {
+		r.once.Do(func() { _ = os.WriteFile(filepath.Join(r.dir, "recent.txt"), []byte("new"), 0o644) })
+		// Make only the host-list mtime scan uncertain while keeping the
+		// following DropInfo listing operational.
+		if strings.Contains(args[1], "newestSummary=$({ find") {
+			args = append([]string(nil), args...)
+			args[1] = strings.Replace(args[1], `find "$d" ! -type d`, "find /path-that-does-not-exist", 1)
+		}
+	}
+	return r.base.Run(ctx, name, args, input, dir)
+}
+
+func TestArchiveJobsDropCapDoesNotFallThrough(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	jobDir(t, f.jobs, "reviewer-a", 20*24*time.Hour)
+	jobDir(t, f.jobs, "reviewer-b", 20*24*time.Hour)
+	f.s.Config.Reap.Archive.Drop = []config.ArchiveDrop{{Host: "local", Glob: "reviewer-*"}}
+	f.s.Config.Reap.Archive.MaxDropsPerRun = 1
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{DryRun: true}); err != nil {
+		t.Fatal(err)
+	}
+	out := f.out.String()
+	if strings.Contains(out, `"result":""`) || !strings.Contains(out, `"eligible_left":1`) {
+		t.Fatalf("invalid cap result: %s", out)
+	}
+	if strings.Contains(out, `"result":"would-archive"`) {
+		t.Fatalf("capped drop fell through to archive: %s", out)
+	}
+}
+
+func TestArchiveJobsDropSummaryCounts(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	jobDir(t, f.jobs, "reviewer-old", 20*24*time.Hour)
+	f.s.Config.Reap.Archive.Drop = []config.ArchiveDrop{{Host: "local", Glob: "reviewer-*"}}
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{DryRun: true}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(f.out.String(), `"would_drop":1`) {
+		t.Fatalf("summary omits would_drop: %s", f.out.String())
+	}
+}
+
+func TestArchiveJobsDropBudgetDeadline(t *testing.T) {
+	f := newArchiveFixture(t, noAgents)
+	jobDir(t, f.jobs, "reviewer-old", 20*24*time.Hour)
+	f.s.Config.Reap.Archive.Drop = []config.ArchiveDrop{{Host: "local", Glob: "reviewer-*"}}
+	f.s.Config.Reap.Archive.MaxRun = "2s"
+	f.s.Runner = archiveBlockRunner{base: f.run, match: "find \"$1\" -name .git"}
+	if err := f.s.ArchiveJobs(context.Background(), "", 14*24*time.Hour, Options{}); err != nil {
+		t.Fatalf("budget stop returned error: %v", err)
+	}
+	out := f.out.String()
+	if !strings.Contains(out, `"stopped_on_budget":true`) || !strings.Contains(out, `"eligible_left":1`) {
+		t.Fatalf("missing budget accounting: %s", out)
+	}
+}
+
 func TestArchiveJobsBlockingPaneScanStopsAtMaxRunWithSummary(t *testing.T) {
 	f := newArchiveFixture(t, noAgents)
 	f.s.Config.Reap.Archive.MaxRun = "50ms"

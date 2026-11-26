@@ -137,8 +137,8 @@ type File struct {
 	Path   string `json:"path"`
 	Size   int64  `json:"size"`
 	SHA256 string `json:"sha256,omitempty"`
-	mtime  int64
-	kind   byte // f regular, l symlink, o anything else
+	Mtime  int64  `json:"-"`
+	kind   byte   // f regular, l symlink, o anything else
 }
 
 // HostJobSummary is the compact metadata needed to decide host-wide skips.
@@ -400,7 +400,7 @@ func parseFiles(dir string, b []byte) ([]File, error) {
 		if e1 != nil || e2 != nil {
 			return nil, fmt.Errorf("list %s: malformed record", dir)
 		}
-		out = append(out, File{Path: strings.TrimPrefix(parts[3], "./"), Size: size, mtime: mtime, kind: parts[0][0]})
+		out = append(out, File{Path: strings.TrimPrefix(parts[3], "./"), Size: size, Mtime: mtime, kind: parts[0][0]})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out, nil
@@ -710,8 +710,8 @@ func (a *Archiver) RefreshJob(ctx context.Context, h reap.Host, job, dir string)
 	}
 	summary := HostJobSummary{Kind: 'd', HasEvents: hasEvents, Finished: finished(files)}
 	for _, f := range files {
-		if f.mtime > summary.Newest {
-			summary.Newest = f.mtime
+		if f.Mtime > summary.Newest {
+			summary.Newest = f.Mtime
 		}
 	}
 	reason, newest := HostSkipReason(summary)
@@ -768,14 +768,23 @@ func (a *Archiver) Drop(ctx context.Context, h reap.Host, dir string, files []Fi
 		return &Skip{"job-changed"}
 	}
 	for i := range files {
-		if again[i].Path != files[i].Path || again[i].Size != files[i].Size || again[i].mtime != files[i].mtime || again[i].kind != files[i].kind {
+		if again[i].Path != files[i].Path || again[i].Size != files[i].Size || again[i].Mtime != files[i].Mtime || again[i].kind != files[i].kind {
 			return &Skip{"job-changed"}
 		}
 	}
 	if !path.IsAbs(dir) {
 		return errors.New("drop path is not absolute")
 	}
-	_, err = a.on(ctx, h.SSH, "", "sh", "-c", `rm -rf "$1"`, "sh", dir)
+	_, err = a.on(ctx, h.SSH, "", "sh", "-c", `
+rm -rf "$1" || {
+	# chmod never follows symlinks; find does not descend through symlinks.
+	# Restore owner write/search only within the checked job tree, then retry.
+	chmod u+rwx "$1"
+	find "$1" -type d -exec chmod u+rwx {} +
+	find "$1" ! -type l -type f -exec chmod u+rw {} +
+	rm -rf "$1"
+}
+`, "sh", dir)
 	return err
 }
 
@@ -810,8 +819,8 @@ func (a *Archiver) planListed(ctx context.Context, h reap.Host, job, dir string,
 	sort.Strings(p.checkouts)
 	sort.Slice(p.ExcludedEntries, func(i, j int) bool { return p.ExcludedEntries[i].Path < p.ExcludedEntries[j].Path })
 	for _, f := range files {
-		if f.mtime > p.Newest {
-			p.Newest = f.mtime
+		if f.Mtime > p.Newest {
+			p.Newest = f.Mtime
 		}
 	}
 	// Every entry is classified before any content is read, so the job's text
@@ -1256,7 +1265,7 @@ func (a *Archiver) copy(ctx context.Context, p *Plan) error {
 func textArchive(p *Plan) ([]byte, error) {
 	mtime := make(map[string]int64, len(p.entries))
 	for _, f := range p.entries {
-		mtime[f.Path] = f.mtime
+		mtime[f.Path] = f.Mtime
 	}
 	var b bytes.Buffer
 	tw := tar.NewWriter(&b)
@@ -1455,7 +1464,7 @@ func same(a, b []File) bool {
 		return false
 	}
 	for i := range a {
-		if a[i].Path != b[i].Path || a[i].Size != b[i].Size || a[i].mtime != b[i].mtime || a[i].kind != b[i].kind {
+		if a[i].Path != b[i].Path || a[i].Size != b[i].Size || a[i].Mtime != b[i].Mtime || a[i].kind != b[i].kind {
 			return false
 		}
 	}
@@ -1678,7 +1687,8 @@ rm -rf "$1" || {
 	# Restore owner write/search only within the checked job tree, then retry.
 	chmod u+rwx "$1" &&
 	find "$1" -type d -exec chmod u+rwx {} \; &&
-	find "$1" ! -type l -type f -exec chmod u+rw {} + &&
+	find "$1" ! -type l -type f -exec chmod u+rw {} +
+	&&
 	rm -rf "$1"
 }
 `, "sh", p.Dir); err != nil {

@@ -263,6 +263,29 @@ func TestPlanDriveMaxFileBytesMovesSmallAndListsLarge(t *testing.T) {
 	}
 }
 
+func TestDropRestoresPermissionsAndRetries(t *testing.T) {
+	e := setup(t)
+	dir := filepath.Join(e.jobs, "wk-readonly-drop")
+	write(t, filepath.Join(dir, "nested", "data"), "payload")
+	if err := os.Chmod(filepath.Join(dir, "nested"), 0o500); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	a := archiver(e, "")
+	files, err := a.refreshList(context.Background(), reap.Host{Name: "h1"}, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Drop(context.Background(), reap.Host{Name: "h1"}, dir, files); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("drop dir remains: %v", err)
+	}
+}
+
 func TestArchiveTaskLayoutSkipsGitCheckoutAndSecretText(t *testing.T) {
 	e := setup(t)
 	dir := filepath.Join(e.jobs, "wk-layout-repro")

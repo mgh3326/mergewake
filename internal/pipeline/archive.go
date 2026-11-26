@@ -555,13 +555,45 @@ hosts:
 			} else if !jobsByName[job].NeedsRefresh && now.Sub(time.Unix(newest, 0)) < olderThan {
 				row.Result, row.Reason = "skipped", "too-new"
 			} else if dropConfigured(s.Config.Reap.Archive.Drop, h.Name, job) && droppedThisRun < maxDrops {
+				if budgetSpent() {
+					stoppedOnBudget = true
+					unscannedReasons[h.Name] = "max_run deadline before drop"
+					unscannedStart = entered - 1
+					countPendingEligible(jobIndex)
+					break hosts
+				}
 				count, size, safeFiles, dropErr := a.DropInfo(runCtx, h, filepath.Join(root, job))
+				if deadlineErr(dropErr) {
+					stoppedOnBudget = true
+					unscannedReasons[h.Name] = "max_run deadline during drop info"
+					unscannedStart = entered - 1
+					countPendingEligible(jobIndex)
+					break hosts
+				}
+				if dropErr == nil {
+					var newest int64
+					for _, file := range safeFiles {
+						if file.Mtime > newest {
+							newest = file.Mtime
+						}
+					}
+					if newest == 0 || now.Sub(time.Unix(newest, 0)) < olderThan {
+						dropErr = &archive.Skip{Reason: "too-new"}
+					}
+				}
 				if dropErr != nil {
 					row.Result, row.Reason = archive.Reason(dropErr)
 				} else if !acting {
 					row.Result, row.Files, row.Bytes = "would-drop", count, size
 				} else if refreshErr := s.refreshArchivePane(ctx, hs, root, job); refreshErr != nil {
-					row.Result, row.Reason = "error", refreshErr.Error()
+					if deadlineErr(refreshErr) {
+						stoppedOnBudget = true
+						unscannedReasons[h.Name] = "max_run deadline during drop pane refresh"
+						unscannedStart = entered - 1
+						countPendingEligible(jobIndex)
+						break hosts
+					}
+					row.Result, row.Reason = archiveJobsReason(refreshErr)
 				} else if liveName(hs, job) || hs.paneInUse(filepath.Join(root, job)) {
 					row.Result, row.Reason = "skipped", "pane-live"
 				} else if dropErr = a.Drop(ctx, h, filepath.Join(root, job), safeFiles); dropErr != nil {
@@ -574,6 +606,7 @@ hosts:
 				}
 			} else if dropConfigured(s.Config.Reap.Archive.Drop, h.Name, job) {
 				eligibleLeft++
+				continue
 			} else {
 				timed.phase = "job_reads"
 				files, reason, newest, refreshErr := a.RefreshJob(runCtx, h, job, filepath.Join(root, job))
@@ -725,6 +758,8 @@ hosts:
 		Archived         int               `json:"archived"`
 		Retained         int               `json:"archived_retained"`
 		Planned          int               `json:"planned"`
+		Dropped          int               `json:"dropped"`
+		WouldDrop        int               `json:"would_drop"`
 		Skipped          int               `json:"skipped"`
 		ErrCount         int               `json:"errors"`
 		EligibleLeft     int               `json:"eligible_left"`
@@ -732,7 +767,7 @@ hosts:
 		StoppedOnBudget  bool              `json:"stopped_on_budget"`
 		UnscannedHosts   []string          `json:"unscanned_hosts,omitempty"`
 		UnscannedReasons map[string]string `json:"unscanned_host_reasons,omitempty"`
-	}{"archive-jobs", !acting, olderThan.String(), counts["archived"], counts["archived-retained"], counts["would-archive"], counts["skipped"], len(errs), eligibleLeft, archiveEligibleScope, stoppedOnBudget, unscanned, unscannedReasons}
+	}{"archive-jobs", !acting, olderThan.String(), counts["archived"], counts["archived-retained"], counts["would-archive"], counts["dropped"], counts["would-drop"], counts["skipped"], len(errs), eligibleLeft, archiveEligibleScope, stoppedOnBudget, unscanned, unscannedReasons}
 	if e := s.Print(summary); e != nil {
 		errs = append(errs, e)
 	}
