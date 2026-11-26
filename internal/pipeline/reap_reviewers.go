@@ -386,9 +386,9 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 	}
 	visitCtx, cancelVisit := ctx, func() {}
 	for _, c := range cands {
-		if w.oldPathRetry(c.label.name, c.host) {
-			// Keep time for later reap stages when replaying the historical
-			// already-gone labels. The cursor resumes the remaining candidates.
+		if prNum == 0 && (w.oldPathRetry(c.label.name, c.host) || w.legacyPathPendingRetry(c.label.name, c.host)) {
+			// Keep time for later reap stages while old or still-pending legacy
+			// work is in the candidate set. The cursor resumes remaining labels.
 			visitCtx, cancelVisit = reapStageShare(ctx, 2, 3)
 			break
 		}
@@ -795,6 +795,30 @@ func (w *reviewerSweep) oldPathRetry(label, host string) bool {
 		}
 	}
 	return missingSuffixedPath && !legacyPathVisited
+}
+
+// legacyPathPendingRetry reports a reopened already-gone label whose legacy
+// probe has started but left nonterminal work. Keep its reviewer share on
+// later passes even though the legacy-path receipt suppresses oldPathRetry.
+func (w *reviewerSweep) legacyPathPendingRetry(label, host string) bool {
+	if host == "" {
+		return false
+	}
+	host = w.hostName(host)
+	missingSuffixedPath, pendingLegacyPath := false, false
+	for _, row := range w.streams[label] {
+		if w.hostName(row.Host) != host {
+			continue
+		}
+		base := filepath.Base(filepath.Clean(row.Worktree))
+		if row.Result == "skipped" && row.Reason == reviewerAlreadyGone && base == label+reviewerCheckoutSuffix {
+			missingSuffixedPath = true
+		}
+		if row.Action == "reviewer-reap" && base == label && !reviewerTerminal(row) {
+			pendingLegacyPath = true
+		}
+	}
+	return missingSuffixedPath && pendingLegacyPath
 }
 
 // reviewerStuckAfter is review.panewire.stuck_after: how old a claimed or

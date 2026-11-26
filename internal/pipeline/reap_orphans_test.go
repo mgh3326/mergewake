@@ -144,9 +144,11 @@ func TestOrphanStageRunsAfterReviewerSweepUsesItsShare(t *testing.T) {
 		Host: "node", Label: label, Worktree: "/work/" + label + reviewerCheckoutSuffix,
 		Result: "skipped", Reason: reviewerAlreadyGone})
 	f.hub.hangInspect = "/work/" + label
-	err := f.reap(t, 0, Options{})
-	if err == nil || !strings.Contains(err.Error(), "orphan checkouts") {
-		t.Fatalf("orphan stage did not run after the reviewer sweep's share ended: %v", err)
+	for pass := 1; pass <= 2; pass++ {
+		err := f.reap(t, 0, Options{})
+		if err == nil || !strings.Contains(err.Error(), "orphan checkouts") {
+			t.Fatalf("pass %d: orphan stage did not run after the reviewer sweep's share ended", pass)
+		}
 	}
 }
 
