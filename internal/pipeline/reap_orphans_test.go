@@ -130,6 +130,28 @@ func TestOrphanCheckoutRemovedWhenOldIdleClean(t *testing.T) {
 	}
 }
 
+func TestOrphanStageRunsAfterReviewerSweepUsesItsShare(t *testing.T) {
+	f := newOrphanFix(t)
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	f.s.Config.Reap.RepoBudget = "3s"
+	checkoutsFile := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(checkoutsFile, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.s.Config.Review.Panewire.Checkouts = checkoutsFile
+	label := reviewerLabelFor(67, 3*24*time.Hour)
+	seedReapRows(t, f.s, testRepo.Name, reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: 67,
+		Host: "node", Label: label, Worktree: "/work/" + label + reviewerCheckoutSuffix,
+		Result: "skipped", Reason: reviewerAlreadyGone})
+	f.hub.hangInspect = "/work/" + label
+	for pass := 1; pass <= 2; pass++ {
+		err := f.reap(t, 0, Options{})
+		if err == nil || !strings.Contains(err.Error(), "orphan checkouts") {
+			t.Fatalf("pass %d: orphan stage did not run after the reviewer sweep's share ended", pass)
+		}
+	}
+}
+
 // A checkout a reviewer-job record names is not this path's: the record's
 // reviewer sweep owns it, so nothing is removed or receipted here.
 func TestOrphanCheckoutNamedByRecordNotTouched(t *testing.T) {

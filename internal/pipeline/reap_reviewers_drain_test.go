@@ -291,6 +291,68 @@ func TestReapReviewerLegacyPathRescanUsesPerHostDrain(t *testing.T) {
 	}
 }
 
+func TestReapReviewerLegacyPathProbesHaveIndependentPerHostCap(t *testing.T) {
+	const wantAllowance = 5
+	f := newReviewerFix(t)
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	f.s.Config.Reap.ReviewerDrain = config.ReviewerDrain{PerHost: 1}
+	var initial []reapReceipt
+	for pr := 64; pr <= 69; pr++ {
+		label := reviewerLabelFor(pr, 3*24*time.Hour)
+		initial = append(initial, reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: pr,
+			Host: "node-a", Label: label, Worktree: "/work/" + label + reviewerCheckoutSuffix,
+			Result: "skipped", Reason: reviewerAlreadyGone})
+	}
+	seedReapRows(t, f.s, testRepo.Name, initial...)
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	var legacyInspects int
+	for _, op := range f.hub.ops("worktree.inspect") {
+		if strings.HasSuffix(op["cwd"].(string), "/"+reviewerLabelFor(64, 3*24*time.Hour)) ||
+			strings.HasSuffix(op["cwd"].(string), "/"+reviewerLabelFor(65, 3*24*time.Hour)) ||
+			strings.HasSuffix(op["cwd"].(string), "/"+reviewerLabelFor(66, 3*24*time.Hour)) ||
+			strings.HasSuffix(op["cwd"].(string), "/"+reviewerLabelFor(67, 3*24*time.Hour)) ||
+			strings.HasSuffix(op["cwd"].(string), "/"+reviewerLabelFor(68, 3*24*time.Hour)) ||
+			strings.HasSuffix(op["cwd"].(string), "/"+reviewerLabelFor(69, 3*24*time.Hour)) {
+			if !strings.HasSuffix(op["cwd"].(string), reviewerCheckoutSuffix) {
+				legacyInspects++
+			}
+		}
+	}
+	if legacyInspects != wantAllowance {
+		t.Fatalf("legacy path probes=%d, want allowance %d; rows %v", legacyInspects, wantAllowance, rowSummary(f.rows(t)))
+	}
+	allRows, err := f.s.reapReceipts(testRepo.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var held []reapReceipt
+	for _, row := range allRows {
+		if row.Action == "reviewer-cleanup" && row.Reason == "legacy path probe cap reached for this host; the next pass continues" && row.Result == "pending-cleanup" {
+			held = append(held, row)
+		}
+	}
+	if len(held) != 1 || held[0].Label != initial[wantAllowance].Label {
+		t.Fatalf("labels beyond the probe allowance did not get their own wait row: %v", rowSummary(allRows))
+	}
+	legacyPath := "/work/" + held[0].Label
+	before := len(f.hub.ops("worktree.inspect"))
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	legacyProbeRetried := false
+	for _, op := range f.hub.ops("worktree.inspect")[before:] {
+		if op["cwd"] == legacyPath {
+			legacyProbeRetried = true
+			break
+		}
+	}
+	if !legacyProbeRetried {
+		t.Fatalf("held label %s did not remain a candidate on the next pass", held[0].Label)
+	}
+}
+
 func TestReapReviewerAbsentLegacyPathsDoNotUsePerHostDrain(t *testing.T) {
 	f := newReviewerFix(t)
 	f.s.Config.Hosts[0].WorkRoot = "/work"
