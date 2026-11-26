@@ -455,7 +455,7 @@ func TestDeliverContinuesOwedLadderWorkWhenRoundCountReadFails(t *testing.T) {
 			state: roundRuleState{LadderEscalated: true, LadderEndedNoSuccessor: true},
 			check: func(t *testing.T, n *ackNotifier, run *roundRuleRunner) {
 				if !hasDecisionText(n, "ended without successor") {
-					t.Fatalf("owed ended decision not sent: %+v", n.events)
+					t.Fatal("owed ended decision was not delivered")
 				}
 				if calls, _, _ := escalateSnapshot(run); calls != 0 {
 					t.Fatalf("owed decision re-ran escalation %d times", calls)
@@ -467,7 +467,7 @@ func TestDeliverContinuesOwedLadderWorkWhenRoundCountReadFails(t *testing.T) {
 			state: roundRuleState{LadderEscalated: true, LadderRefusalText: "preflight refused", LadderRefusalRound: 5},
 			check: func(t *testing.T, n *ackNotifier, run *roundRuleRunner) {
 				if !hasDecisionText(n, "refused") {
-					t.Fatalf("owed refusal decision not sent: %+v", n.events)
+					t.Fatal("owed refusal decision was not delivered")
 				}
 				if calls, _, _ := escalateSnapshot(run); calls != 0 {
 					t.Fatalf("owed refusal re-ran escalation %d times", calls)

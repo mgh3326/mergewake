@@ -34,7 +34,7 @@ func TestHubConsult_QueuedConsultAdvancesWhenRoundCountReadFails(t *testing.T) {
 		t.Fatal(err)
 	}
 	if n.count != 0 || len(ledger) != 0 || !s.loadRoundRuleState(r.Name, 7).HubConsultOwed {
-		t.Fatalf("unverified count released queued consult findings: events=%d ledger=%v state=%+v", n.count, ledger, s.loadRoundRuleState(r.Name, 7))
+		t.Fatalf("unverified count released queued consult: events=%d ledger_entries=%d consult_owed=%t", n.count, len(ledger), s.loadRoundRuleState(r.Name, 7).HubConsultOwed)
 	}
 }
 
