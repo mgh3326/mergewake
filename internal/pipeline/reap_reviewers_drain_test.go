@@ -488,6 +488,7 @@ func TestReapReviewerLeakedLabelJoinsItsPaneHostWhenTheRecordIsGone(t *testing.T
 // next pass leaves it alone.
 func TestReapReviewerAgedLabelWithoutAHostSettlesTerminal(t *testing.T) {
 	f := newReviewerFix(t)
+	f.s.Config.Hosts[0].WorkRoot = "/work"
 	label := reviewerLabelFor(33, 2*24*time.Hour)
 	seedDecisionRows(t, f.s, testRepo.Name, map[string]any{"command": "reviewer-held", "value": map[string]any{"pr": 33, "label": label}})
 	if err := f.reap(t, 0, Options{}); err != nil {
@@ -503,6 +504,82 @@ func TestReapReviewerAgedLabelWithoutAHostSettlesTerminal(t *testing.T) {
 	}
 	if len(f.rows(t)) != nrows {
 		t.Fatalf("terminal label revisited: %v", rowSummary(f.rows(t)))
+	}
+}
+
+func TestReapReviewerHostlessCheckoutFindsUniqueHost(t *testing.T) {
+	f := newReviewerFix(t, reap.Host{Name: "node-b", Machine: "node-b", WorkRoot: "/work-b"})
+	f.s.Config.Hosts[0].WorkRoot = "/work-a"
+	f.hub.moreNodes = []any{map[string]any{"machine_id": "node-b", "state": "connected", "agents": []any{}, "panes": []any{}, "panes_ok": true}}
+	label := reviewerLabelFor(34, 2*24*time.Hour)
+	path := "/work-b/" + label + reviewerCheckoutSuffix
+	f.hub.detached[path] = true
+	seedDecisionRows(t, f.s, testRepo.Name, map[string]any{"command": "reviewer-held", "value": map[string]any{"pr": 34, "label": label}})
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	removes := f.hub.ops("worktree.remove")
+	if len(removes) != 1 || removes[0]["cwd"] != path {
+		t.Fatalf("removes %v; rows %v", removes, rowSummary(f.rows(t)))
+	}
+	rows := f.rows(t)
+	if len(rows) != 1 || rows[0].Result != "removed" || rows[0].Host != "node-b" {
+		t.Fatalf("rows: %v", rowSummary(rows))
+	}
+}
+
+func TestReapReviewerHostlessCheckoutAmbiguousOrAbsentSettlesTerminal(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		onBoth bool
+	}{{"absent", false}, {"ambiguous", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newReviewerFix(t, reap.Host{Name: "node-b", Machine: "node-b", WorkRoot: "/work-b"})
+			f.s.Config.Hosts[0].WorkRoot = "/work-a"
+			f.hub.moreNodes = []any{map[string]any{"machine_id": "node-b", "state": "connected", "agents": []any{}, "panes": []any{}, "panes_ok": true}}
+			label := reviewerLabelFor(35, 2*24*time.Hour)
+			f.hub.detached["/work-a/"+label+reviewerCheckoutSuffix] = tc.onBoth
+			f.hub.detached["/work-b/"+label+reviewerCheckoutSuffix] = tc.onBoth
+			seedDecisionRows(t, f.s, testRepo.Name, map[string]any{"command": "reviewer-held", "value": map[string]any{"pr": 35, "label": label}})
+			if err := f.reap(t, 0, Options{}); err != nil {
+				t.Fatal(err)
+			}
+			rows := f.rows(t)
+			if len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != reviewerHostUnknown || len(f.hub.ops("worktree.remove")) != 0 {
+				t.Fatalf("rows %v; removes %v", rowSummary(rows), f.hub.ops("worktree.remove"))
+			}
+		})
+	}
+}
+
+func TestReapReviewerHostlessCheckoutProbeCapWaitsPending(t *testing.T) {
+	f := newReviewerFix(t)
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	labels := make([]string, reviewerLegacyProbesPerHost+2)
+	var decisions []map[string]any
+	for i := range labels {
+		labels[i] = reviewerLabelFor(40+i, 2*24*time.Hour)
+		decisions = append(decisions, map[string]any{"command": "reviewer-held", "value": map[string]any{"pr": 40 + i, "label": labels[i]}})
+	}
+	seedDecisionRows(t, f.s, testRepo.Name, decisions...)
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(f.hub.ops("worktree.inspect")); got != reviewerLegacyProbesPerHost {
+		t.Fatalf("probes %d, want %d", got, reviewerLegacyProbesPerHost)
+	}
+	rows := f.rows(t)
+	if len(rows) != len(labels) {
+		t.Fatalf("rows: %v", rowSummary(rows))
+	}
+	pending := 0
+	for _, row := range rows {
+		if row.Result == "pending-cleanup" && row.Reason == "host checkout probe cap reached for this host; the next pass continues" {
+			pending++
+		}
+	}
+	if pending != 2 {
+		t.Fatalf("pending probe holds %d, rows %v", pending, rowSummary(rows))
 	}
 }
 

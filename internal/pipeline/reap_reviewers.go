@@ -170,6 +170,7 @@ const (
 	// reviewerLegacyProbeHold bounds the extra refresh and inspect used to
 	// check the pre-suffix worktree layout for an already-gone label.
 	reviewerLegacyProbeHold = "legacy path probe cap reached for this host; the next pass continues"
+	reviewerHostProbeHold   = "host checkout probe cap reached for this host; the next pass continues"
 	// reviewerLegacyProbesPerHost bounds the remote fallback probes independently
 	// of guarded removals. The old-path backlog must not monopolize a pass.
 	reviewerLegacyProbesPerHost = 5
@@ -240,6 +241,7 @@ func reviewerLabelOf(v reapReceipt) string {
 
 type reviewerSweep struct {
 	s          *Service
+	ctx        context.Context
 	r          config.Repo
 	hosts      []*reapHost
 	acting     bool
@@ -333,7 +335,7 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 	if e != nil {
 		return []error{fmt.Errorf("reviewer reap: review.panewire.stuck_after: %w", e)}
 	}
-	w := &reviewerSweep{s: s, r: r, hosts: hosts, acting: acting, now: s.now(), settle: d + time.Minute, stuckAfter: stuckAfter, note: note, streams: map[string]map[string]reapReceipt{}, remote: map[string]map[string]string{}, abandoned: map[string]bool{}, stuck: map[string]bool{}, pulls: map[int]github.Pull{}, audits: map[string]reviewerAudit{}, auditOnly: map[string]bool{}, rowed: map[string]bool{}, resumable: prNum == 0 && durable}
+	w := &reviewerSweep{s: s, ctx: ctx, r: r, hosts: hosts, acting: acting, now: s.now(), settle: d + time.Minute, stuckAfter: stuckAfter, note: note, streams: map[string]map[string]reapReceipt{}, remote: map[string]map[string]string{}, abandoned: map[string]bool{}, stuck: map[string]bool{}, pulls: map[int]github.Pull{}, audits: map[string]reviewerAudit{}, auditOnly: map[string]bool{}, rowed: map[string]bool{}, resumable: prNum == 0 && durable}
 	if jobs, ok := s.Sink.(reapJobs); ok {
 		w.jobs = reapTimedJobs{base: jobs, telemetry: telemetryFrom(ctx)}
 	}
@@ -1632,16 +1634,83 @@ func (w *reviewerSweep) removeUnrecorded(ctx context.Context, l reviewerLabel, c
 		w.record(rec, "kept", "job-host-unconfigured")
 	} else {
 		// No record, receipt or audit row names a host, so no remote path can
-		// be built: the label holds no worktree this sweep can find.
-		rec := w.row(l)
-		rec.Host, rec.Worktree = c.host, l.name
-		if w.acting {
-			w.record(rec, "kept", reviewerHostUnknown)
+		// be built. Search the configured work roots before settling it.
+		if hs, uncertain, capped := w.findUnrecordedCheckout(l); hs != nil {
+			if w.removeRemote(ctx, hs, l, "") == remoteStop {
+				return
+			}
+		} else if uncertain {
+			rec := w.row(l)
+			rec.Worktree = l.name
+			if capped != "" {
+				rec.Host, rec.Cwd = capped, reviewerWorktreePath(w.scannedHost(capped), l)
+				w.record(rec, "pending-cleanup", reviewerHostProbeHold)
+			} else {
+				w.record(rec, "pending-cleanup", "host checkout probe unavailable")
+			}
+			return
 		} else {
-			w.record(rec, "pending-cleanup", "remote host unavailable")
+			rec := w.row(l)
+			rec.Host, rec.Worktree = c.host, l.name
+			if w.acting {
+				w.record(rec, "kept", reviewerHostUnknown)
+			} else {
+				w.record(rec, "pending-cleanup", "remote host unavailable")
+			}
 		}
 	}
 	w.removeLocal(ctx, l)
+}
+
+// findUnrecordedCheckout probes the spec checkout path on hosts without a
+// work root or failed scan left the result uncertain. The shared probe budget
+// never spends a guarded-removal slot; dry runs do no remote inspection.
+func (w *reviewerSweep) findUnrecordedCheckout(l reviewerLabel) (*reapHost, bool, string) {
+	if !w.acting {
+		return nil, false, ""
+	}
+	var found *reapHost
+	uncertain := false
+	capped := ""
+	for _, hs := range w.hosts {
+		if hs.host.Local() {
+			continue
+		}
+		path := reviewerWorktreePath(hs, l)
+		if path == "" {
+			uncertain = true
+			continue
+		}
+		if hs.failed {
+			uncertain = true
+			continue
+		}
+		if !w.takeLegacyProbe(hs.host.Name) {
+			uncertain = true
+			if capped == "" {
+				capped = hs.host.Name
+			}
+			continue
+		}
+		tree, err := hs.ops.Inspect(w.ctx, path)
+		if err != nil {
+			if isHostUnreachable(err) {
+				hs.failed = true
+			}
+			uncertain = true
+			continue
+		}
+		if tree != nil {
+			if found != nil {
+				return nil, false, ""
+			}
+			found = hs
+		}
+	}
+	if found != nil && !uncertain {
+		return found, false, ""
+	}
+	return nil, uncertain, capped
 }
 
 // remoteStep is how the remote worktree step ended, as the local step needs it.
