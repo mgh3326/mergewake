@@ -1128,3 +1128,36 @@ func TestMirrorConfigRefused(t *testing.T) {
 		t.Fatalf("daemon.mirror was not refused with an error naming the key: %v", err)
 	}
 }
+
+func TestLoadWatchConfirmWindow(t *testing.T) {
+	load := func(line string) (Config, error) {
+		p := filepath.Join(t.TempDir(), "config.yaml")
+		if err := os.WriteFile(p, []byte("version: 1\nhost: host-a\n"+line), 0600); err != nil {
+			t.Fatal(err)
+		}
+		return Load(p)
+	}
+	t.Run("zero disables the window and loads", func(t *testing.T) {
+		c, err := load("watch_confirm_window: 0\n")
+		if err != nil {
+			t.Fatalf("watch_confirm_window: 0 refused: %v", err)
+		}
+		if c.WatchConfirmWindow != "0" {
+			t.Fatalf("window = %q", c.WatchConfirmWindow)
+		}
+	})
+	t.Run("unset defaults to 30m", func(t *testing.T) {
+		c, err := load("")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if c.WatchConfirmWindow != "30m" {
+			t.Fatalf("default window = %q", c.WatchConfirmWindow)
+		}
+	})
+	t.Run("negative is refused", func(t *testing.T) {
+		if _, err := load("watch_confirm_window: -1s\n"); err == nil {
+			t.Fatal("negative window loaded")
+		}
+	})
+}

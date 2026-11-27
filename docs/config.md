@@ -24,6 +24,7 @@ host, model IDs, commands, and task ID are placeholders. None is a discovery rul
 | `github_app` | Absent | Serve GitHub reads with a GitHub App installation token; see [GitHub App reads](#github-app-reads). Absent means the `token_env` credential serves every request. |
 | `poll_interval` | `60s` | Positive Go duration between completed `watch` iterations. |
 | `watch_limit` | `100` | Maximum commit interval inspected during recovery, from 2 through 1000. |
+| `watch_confirm_window` | `30m` | How long a red whose culprit is the head commit is held before watch names it. A rerun that turns the head green inside the window holds as flaky, with no PR named and no revert. A later red commit in the bracket confirms it at once. `0` disables the window. |
 | `repos` | Empty list | Repositories this host may operate on. Names must be unique. |
 | `hosts` | Empty list | Session hosts scanned by `reap`; see below. |
 | `reap` | Disabled | Merged-PR session/worktree reaping; see below. |

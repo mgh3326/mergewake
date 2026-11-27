@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/fsutil"
@@ -222,10 +223,33 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 			if mixedHead {
 				return s.recoverHeadCulprit(ctx, r, p, head, checks, result, o, inc)
 			}
+			m, found, re := s.readRedSeen(r.Name)
+			if re != nil {
+				return re
+			}
+			// The mixed hold is for a held culprit inside its window. Once the
+			// window has run out the culprit is confirmed durably, so the hold
+			// never outlasts it; a confirmed culprit fails as it did before the
+			// window. A shadow or dry pass only reads, so it never holds here.
+			if found && m.Culprit == head && !m.Confirmed && !result.Shadow && !o.DryRun {
+				if s.Service.now().Sub(m.Since) < s.confirmWindow() {
+					result.Action = "hold"
+					result.Reason = "mixed result: a passing rerun status sits beside the red check run; held, not reverted"
+					return s.reportWatch(ctx, r, result, head+":mixed", o)
+				}
+				m.Confirmed = true
+				if re = fsutil.WriteJSON(s.redSeenFile(r.Name), m); re != nil {
+					return re
+				}
+			}
 		}
 		return e
 	}
 	checkpoint := s.checkpoint(r.Name)
+	// A shadow or dry pass persists nothing: it never writes or reads the
+	// confirmation marker, so it keeps today's result.
+	acting := !result.Shadow && !o.DryRun
+	window := s.confirmWindow()
 	if ci == github.Green {
 		if !s.deploy && !o.DryRun {
 			if e = s.clearWatchHoldEpisode(r.Name); e != nil {
@@ -241,6 +265,15 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 				return e
 			}
 			if !settled {
+				return nil
+			}
+		}
+		if acting {
+			settled, e := s.settleGreenHead(ctx, r, head, window, &result, o)
+			if e != nil {
+				return e
+			}
+			if settled {
 				return nil
 			}
 		}
@@ -481,6 +514,18 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 		result.Culprit = culprit
 		return hold("culprit is not a single identifiable merged PR")
 	}
+	// A head culprit has no later commit to corroborate its red. Its red is
+	// held for the confirmation window; a rerun that passes inside it settles
+	// the red as flaky, and the window's expiry confirms it as today.
+	if window > 0 && acting {
+		held, e := s.confirmHeadRed(r, culprit, index == len(chain)-1, window)
+		if e != nil {
+			return e
+		}
+		if held {
+			return hold(fmt.Sprintf("main red on %s: culprit candidate #%d unconfirmed; rerun the failed jobs to settle it", strings.Join(bisectChecks, ", "), origin.Number))
+		}
+	}
 	if e = s.ObservePR(ctx, r, *origin, o); e != nil {
 		return e
 	}
@@ -698,8 +743,14 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 	if result.Reason != "" {
 		note += ": " + result.Reason
 	}
-	e = errors.Join(s.Sink.Record(reportCtx, "mergewake/"+result.Action+"/"+result.Head, data),
-		s.Notifier.Notify(reportCtx, integrations.Event{ID: "mergewake-" + result.Action + "-" + result.Head, Type: "watch-hold", Text: note, Lane: s.ownerLane(r)}))
+	// The flaky outcome is its own hold: a first-sighting hold on the same head
+	// shares its event ID otherwise, and the notifier would drop it as duplicate.
+	kind := result.Action
+	if result.Action == "hold" && watchHoldReasonClass(result.Reason) == "flaky" {
+		kind = "hold-flaky"
+	}
+	e = errors.Join(s.Sink.Record(reportCtx, "mergewake/"+kind+"/"+result.Head, data),
+		s.Notifier.Notify(reportCtx, integrations.Event{ID: "mergewake-" + kind + "-" + result.Head, Type: "watch-hold", Text: note, Lane: s.ownerLane(r)}))
 	if e != nil {
 		return e
 	}
@@ -868,4 +919,134 @@ func (s *Service) recoveryTrailers(ctx context.Context, r config.Repo, pr github
 		}
 	}
 	return strings.Join(lines, "\n"), nil
+}
+
+// redSeen is the durable marker for a head culprit whose red is inside its
+// confirmation window. Confirmed is written when the window expires: the culprit
+// is then named as today, and a later pass never holds it again.
+type redSeen struct {
+	Culprit   string    `json:"culprit"`
+	Since     time.Time `json:"since"`
+	Confirmed bool      `json:"confirmed,omitempty"`
+}
+
+// redSeenFile is per stream, as the checkpoint is, so a deploy red never
+// confirms or clears a main-stream red.
+func (s *watchStream) redSeenFile(repo string) string {
+	name := "red-seen.json"
+	if s.deploy {
+		name = "deploy-red-seen.json"
+	}
+	return filepath.Join(s.state(repo), name)
+}
+
+func (s *watchStream) readRedSeen(repo string) (redSeen, bool, error) {
+	var m redSeen
+	found, e := fsutil.ReadJSON(s.redSeenFile(repo), &m)
+	return m, found, e
+}
+
+func (s *watchStream) clearRedSeen(repo string) error {
+	if e := os.Remove(s.redSeenFile(repo)); e != nil && !os.IsNotExist(e) {
+		return e
+	}
+	return nil
+}
+
+// confirmWindow is how long a head culprit's red is held before it is named.
+// Zero disables the window; an operator sets it to 0 to get today's result.
+func (s *Service) confirmWindow() time.Duration {
+	if s.Config.WatchConfirmWindow == "" {
+		return 0
+	}
+	d, e := config.OptionalDuration(s.Config.WatchConfirmWindow)
+	if e != nil {
+		return 0
+	}
+	return d
+}
+
+// confirmHeadRed reports whether culprit's red must be held. A head culprit has
+// no later commit to corroborate it: its first sighting starts the window, and
+// the first pass after the window confirms it durably, so no later pass can
+// hold it again even when a transient error stops this pass before it saves an
+// incident. A culprit with a later red commit in the bracket is corroborated by
+// it, so the marker is dropped and the culprit is named at once.
+func (s *watchStream) confirmHeadRed(r config.Repo, culprit string, headCulprit bool, window time.Duration) (bool, error) {
+	m, found, e := s.readRedSeen(r.Name)
+	if e != nil {
+		return false, e
+	}
+	if !headCulprit {
+		if found {
+			return false, s.clearRedSeen(r.Name)
+		}
+		return false, nil
+	}
+	now := s.Service.now()
+	if found && m.Culprit == culprit {
+		if m.Confirmed {
+			return false, nil
+		}
+		if now.Sub(m.Since) >= window {
+			m.Confirmed = true
+			return false, fsutil.WriteJSON(s.redSeenFile(r.Name), m)
+		}
+		return true, nil
+	}
+	return true, fsutil.WriteJSON(s.redSeenFile(r.Name), redSeen{Culprit: culprit, Since: now})
+}
+
+// settleGreenHead runs when the head is green and a head-culprit marker exists.
+// A red that turned green inside its window was a flake: hold with a distinct
+// reason, naming no PR and reverting nothing, and clear the marker only after
+// the notice is out. A green descendant of the marked culprit (a fix forward,
+// or a manual revert) clears the marker and takes the healthy path. A green
+// ancestor of the culprit on its first-parent walk (the deploy stream's
+// walk-back while a rerun runs) keeps the marker and takes the healthy path.
+// Returns true when the pass is settled here.
+func (s *watchStream) settleGreenHead(ctx context.Context, r config.Repo, head string, window time.Duration, result *watchResult, o Options) (bool, error) {
+	m, found, e := s.readRedSeen(r.Name)
+	if e != nil || !found {
+		return false, e
+	}
+	if m.Culprit == head && !m.Confirmed && s.Service.now().Sub(m.Since) < window {
+		result.Action = "hold"
+		result.Reason = "flaky: red did not hold on rerun"
+		if e = s.reportWatch(ctx, r, *result, head+":flaky", o); e != nil {
+			return true, e
+		}
+		return true, s.clearRedSeen(r.Name)
+	}
+	if m.Culprit != head {
+		ancestor, e := s.firstParentAncestor(ctx, r, head, m.Culprit)
+		if e != nil {
+			return false, e
+		}
+		if ancestor {
+			return false, nil
+		}
+	}
+	return false, s.clearRedSeen(r.Name)
+}
+
+// firstParentAncestor reports whether ancestor is on the first-parent walk from
+// descendant. The walk stops at watch_limit steps, the same bound the bisect
+// walk uses, so a long history costs a bounded number of reads.
+func (s *watchStream) firstParentAncestor(ctx context.Context, r config.Repo, ancestor, descendant string) (bool, error) {
+	cur := descendant
+	for i := 0; i < s.Config.WatchLimit; i++ {
+		c, e := s.GH.Commit(ctx, r.Name, cur)
+		if e != nil {
+			return false, e
+		}
+		if len(c.Parents) == 0 {
+			return false, nil
+		}
+		cur = c.Parents[0].SHA
+		if cur == ancestor {
+			return true, nil
+		}
+	}
+	return false, nil
 }
