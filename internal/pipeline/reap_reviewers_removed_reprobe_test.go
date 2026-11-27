@@ -386,3 +386,35 @@ func TestReapReviewerHeldRemovedLabelTakesNextTurn(t *testing.T) {
 		t.Fatalf("held label never took its turn: removes %v", f.hub.ops("worktree.remove"))
 	}
 }
+
+// A checkout recreated and removed again inside the day, after its label's pane
+// closed, is found again at the due re-inspect: the recreated removal row
+// shadows the absent row, so only its own day brings the label back (hk 6992).
+// Fails without absentDue counting a recreated removal row.
+func TestReapReviewerRecreatedRemovalReadmitsAfterADay(t *testing.T) {
+	f := newReviewerFix(t)
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	host := f.s.Config.Hosts[0].Name
+	pr := 12
+	label := reviewerLabelFor(pr, time.Hour)
+	path := "/work/" + label + reviewerCheckoutSuffix
+	f.hub.detached[path] = true
+	f.sink.recs[label] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: label, Host: host}
+	seedReapRows(t, f.s, testRepo.Name, removedStreamRows(pr, label, path, host)...)
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if removes := f.hub.ops("worktree.remove"); len(removes) != 1 {
+		t.Fatalf("first recreated removal: %v (rows %v)", removes, rowSummary(f.rows(t)))
+	}
+	closeSeededPane(t, f, pr, label, host)
+
+	f.hub.detached[path] = true
+	f.s.Now = func() time.Time { return reviewerNow.Add(25 * time.Hour) }
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if removes := f.hub.ops("worktree.remove"); len(removes) != 2 {
+		t.Fatalf("second recreation was not removed: %v (rows %v)", removes, rowSummary(f.rows(t)))
+	}
+}

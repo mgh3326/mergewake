@@ -974,13 +974,19 @@ func (w *reviewerSweep) candidates(lastCleanup map[string]reapReceipt, prNum int
 	return cands
 }
 
-// absentDue reports whether a label's removed path answered absent a day or
-// more ago. Its streams have all ended, so it is visited again only for this:
-// the 24h re-inspect a same-label revival is found by once its pane has closed
-// (hk 6992).
+// absentDue reports whether a label's removed path needs its 24h re-inspect: an
+// absent answer a day old, or a recreated checkout removed again a day ago, which
+// shadows the absent row and must not end the re-inspect (hk 6992). Its streams
+// have all ended, so it is visited again only for this.
 func (w *reviewerSweep) absentDue(label string) bool {
 	for _, v := range w.streams[label] {
-		if v.Result == "skipped" && strings.HasPrefix(v.Reason, reviewerRemovedAbsent) && w.now.Sub(v.Time) >= reviewerRemovedAbsentAfter {
+		if w.now.Sub(v.Time) < reviewerRemovedAbsentAfter {
+			continue
+		}
+		if v.Result == "skipped" && strings.HasPrefix(v.Reason, reviewerRemovedAbsent) {
+			return true
+		}
+		if v.Result == "removed" && strings.HasPrefix(v.Reason, reviewerRecreatedRemoved) {
 			return true
 		}
 	}
