@@ -2313,6 +2313,26 @@ func reviewerRow(v reapReceipt) bool {
 	return v.Action == "reviewer-cleanup" || v.Action == "reviewer-reap"
 }
 
+// reviewerNoRefetch reports whether a receipt must never queue a PR refetch:
+// every reviewer-reap row, and a reviewer-cleanup row that holds a probe cap
+// or a host checkout the sweep has not resolved. The sweep rescans those itself.
+func reviewerNoRefetch(v reapReceipt) bool {
+	if v.Action == "reviewer-reap" {
+		return true
+	}
+	if v.Action != "reviewer-cleanup" {
+		return false
+	}
+	switch {
+	case v.Reason == reviewerLegacyProbeHold,
+		strings.HasPrefix(v.Reason, "host checkout probe cap reached at "),
+		strings.HasPrefix(v.Reason, reviewerHostsPendingPrefix),
+		strings.HasPrefix(v.Reason, reviewerHostsSeveralPrefix):
+		return true
+	}
+	return false
+}
+
 // reviewerAlreadyGone is the reason a guarded removal records when the
 // checkout was already gone before mergewake's removal ran.
 const reviewerAlreadyGone = "worktree already gone"

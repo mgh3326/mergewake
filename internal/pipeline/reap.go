@@ -909,15 +909,13 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		// Receipt-named PRs can be older than the listing horizon. A fetch
 		// failure only loses that PR this pass; it never aborts the rest.
 		for _, rec := range receipts {
-			// A check-pr stamp is the attempt a refetch already made, so it never
-			// queues a refetch itself; it still stamps lastPRCheck.
-			if rec.PR == 0 || rec.Action == "check-pr" || known[rec.PR] || h.prDone(rec.PR) || now.Sub(h.lastPRCheck[rec.PR]) < refetchAfter {
-				continue
-			}
-			// A reviewer row can name a merged PR whose bound job's worktree the
-			// listing missed (hk 6987). It queues one refetch only: the stamp
-			// below makes lastPRCheck non-zero, so no later pass queues it again.
-			if reviewerRow(rec) && !h.lastPRCheck[rec.PR].IsZero() {
+			// The reviewer sweep covers its own hold rows and reviewer-reap rows
+			// whatever the PR's state, so those never queue a refetch (hk 6864).
+			// Any other reviewer-cleanup row names a PR whose bound job's worktree
+			// the listing may have missed, and queues a refetch as before #618
+			// (hk 6987). A check-pr stamp is the attempt a refetch already made,
+			// so it never queues one itself; it still stamps lastPRCheck.
+			if rec.PR == 0 || reviewerNoRefetch(rec) || rec.Action == "check-pr" || known[rec.PR] || h.prDone(rec.PR) || now.Sub(h.lastPRCheck[rec.PR]) < refetchAfter {
 				continue
 			}
 			known[rec.PR] = true
