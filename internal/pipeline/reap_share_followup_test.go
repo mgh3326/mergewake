@@ -103,8 +103,10 @@ func TestCorruptReviewerCursorIsRepaired(t *testing.T) {
 	}
 }
 
+// The budget cuts the worker stage mid-order, so stopAt would rewrite the
+// cursor over the unreadable file. Preservation is what keeps the symlink.
 func TestWorkerCursorIOErrorPreservesFile(t *testing.T) {
-	f := budgetWorkerFix(t, 3, "", 0)
+	f := budgetWorkerFix(t, 24, "600ms", 50*time.Millisecond)
 	path := filepath.Join(f.s.state(testRepo.Name), "worker-worktree-cursor.json")
 	if err := os.Symlink(path, path); err != nil {
 		t.Fatal(err)
@@ -115,6 +117,9 @@ func TestWorkerCursorIOErrorPreservesFile(t *testing.T) {
 	}
 	if info, err := os.Lstat(path); err != nil || info.Mode()&os.ModeSymlink == 0 {
 		t.Fatalf("worker cursor path changed after I/O error: info=%v err=%v", info, err)
+	}
+	if got := len(f.s.Sink.(*slowJobSink).read); got == 0 || got == 24 {
+		t.Fatalf("worker stage did not run and cut mid-stage: read %d candidates", got)
 	}
 }
 
