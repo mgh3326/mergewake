@@ -1020,15 +1020,16 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 				}
 			}
 			// The job audits the grade panewire routes this spawn at: the --grade
-			// sent, else the task title's grade when the title's floor won. The
-			// shared routing decision stays as the run made it.
+			// sent, else the task title's grade, which panewire uses when no
+			// --grade is sent. The PR grade stays only when the title has none.
+			// The shared routing decision stays as the run made it.
 			routing := x.routing
 			if routing != nil {
 				decided := *routing
 				switch {
 				case sendGrade:
 					decided.GradeAsked = x.spawnGrade
-				case x.spawnGrade != "":
+				case titleGrade != "":
 					decided.GradeAsked = titleGrade
 				}
 				routing = &decided
