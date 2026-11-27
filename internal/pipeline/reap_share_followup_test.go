@@ -84,6 +84,27 @@ func TestCorruptWorkerCursorIsRepaired(t *testing.T) {
 	}
 }
 
+// A decode-error cursor sets w.unreadable, so a completed stage clears it to the
+// zero cursor even though no position was read. Only the !w.unreadable term in
+// workerPass.finished reaches that write: without it the zero cursor returns
+// early and the corrupt file survives the stage.
+func TestWorkerCursorDecodeErrorIsClearedOnCompletedStage(t *testing.T) {
+	f := budgetWorkerFix(t, 3, "", 0)
+	path := filepath.Join(f.s.state(testRepo.Name), "worker-worktree-cursor.json")
+	writeCorrupt(t, path)
+
+	if err := f.reap(t, 0, Options{}); err == nil || !strings.Contains(err.Error(), "worker worktrees: resume cursor") {
+		t.Fatalf("the decode-error worker cursor was not reported on its pass: %v", err)
+	}
+	var got workerCursor
+	if !decodes(path, &got) || got != (workerCursor{}) {
+		t.Fatalf("the completed stage did not clear the decode-error cursor %s to the zero cursor: %+v", path, got)
+	}
+	if err := f.reap(t, 0, Options{}); err != nil && strings.Contains(err.Error(), "worker worktrees: resume cursor") {
+		t.Fatalf("the pass after a completed stage still reports the cursor: %v", err)
+	}
+}
+
 // The reviewer sweep cursor is repaired the same way.
 func TestCorruptReviewerCursorIsRepaired(t *testing.T) {
 	f := newReviewerFix(t)
@@ -103,9 +124,14 @@ func TestCorruptReviewerCursorIsRepaired(t *testing.T) {
 	}
 }
 
-// The stage completes after the cursor read fails: finished sees the unreadable
-// cursor and must not replace it with a zero cursor. Only the !w.unreadable
-// guard in workerPass.finished keeps the symlink, so removing it fails here.
+// The stage completes after the cursor read fails with an I/O error (ELOOP from
+// the self-referencing symlink, not a decode error). w.unreadable stays false and
+// the cursor is the zero value, so the !w.unreadable term in workerPass.finished
+// is not reached and the symlink survives the early return. This test fails if
+// that whole early return is removed, or if the I/O error is classified as
+// unreadable (reap_worker.go), since finished then writes over the path. It does
+// not cover the !w.unreadable term itself: that is
+// TestWorkerCursorDecodeErrorIsClearedOnCompletedStage.
 func TestWorkerCursorIOErrorPreservesFileOnCompletedStage(t *testing.T) {
 	f := budgetWorkerFix(t, 3, "", 0)
 	path := filepath.Join(f.s.state(testRepo.Name), "worker-worktree-cursor.json")
