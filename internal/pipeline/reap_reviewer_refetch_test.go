@@ -31,9 +31,10 @@ func (g *pullLog) fetched(pr int) bool {
 	return false
 }
 
-// Hold rows of the reviewer sweep (probe-cap holds and unresolved host
-// checkouts, hk 6864) never queue a GitHub Pull, whatever their PR's state,
-// and neither does a reviewer-reap row: the sweep covers its own rows.
+// Hold rows of the reviewer sweep (probe-cap holds, unresolved host checkouts,
+// drain and budget holds; hk 6864, hk 6993) never queue a GitHub Pull, whatever
+// their PR's state, and neither does a reviewer-reap row: the sweep covers its
+// own rows.
 func TestReapReviewerHeldRowsDoNotRefetchTheirPRs(t *testing.T) {
 	gh := &pullLog{}
 	r := &scriptRunner{outs: worktreeOuts("/repo")}
@@ -43,6 +44,8 @@ func TestReapReviewerHeldRowsDoNotRefetchTheirPRs(t *testing.T) {
 		fmt.Sprintf(reviewerHostProbeHold, "node-b"),
 		reviewerHostsPendingPrefix + "node-a",
 		reviewerHostsSeveralPrefix + "node-a, node-b",
+		reviewerDrainHold,
+		reviewerBudgetHold,
 	}
 	var rows []reapReceipt
 	for i, reason := range holds {
@@ -53,19 +56,26 @@ func TestReapReviewerHeldRowsDoNotRefetchTheirPRs(t *testing.T) {
 			Result: "pending-cleanup", Reason: reason,
 			Time: time.Now().Add(-25 * time.Hour).UTC()})
 	}
-	rows = append(rows, reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: 95,
-		Host: "node-a", Label: "rv-95", Worktree: "/work/rv-95" + reviewerCheckoutSuffix,
+	rows = append(rows, reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: 96,
+		Host: "node-a", Label: "rv-96", Worktree: "/work/rv-96" + reviewerCheckoutSuffix,
 		Result: "removed", Time: time.Now().Add(-25 * time.Hour).UTC()})
 	// The base wrote a check-pr stamp per refetch: an old one left beside a
 	// hold must not queue the PR either.
 	rows = append(rows, reapReceipt{Action: "check-pr", Repo: testRepo.Name, PR: 90, Result: "checked",
 		Time: time.Now().Add(-25 * time.Hour).UTC()})
+	// Control: an ordinary reviewer-cleanup row still queues its PR's refetch.
+	rows = append(rows, reapReceipt{Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 97,
+		Host: "node-a", Label: "rv-97", Worktree: "/work/rv-97" + reviewerCheckoutSuffix,
+		Result: "removed", Reason: "pane gone", Time: time.Now().Add(-25 * time.Hour).UTC()})
 	seedReapRows(t, s, testRepo.Name, rows...)
 	_ = s.Reap(context.Background(), testRepo, 0, Options{})
-	for pr := 90; pr <= 95; pr++ {
+	for pr := 90; pr <= 96; pr++ {
 		if gh.fetched(pr) {
-			t.Fatalf("hold or reviewer-reap row refetched PR %d; fetched %v", pr, gh.prs)
+			t.Errorf("hold or reviewer-reap row refetched PR %d; fetched %v", pr, gh.prs)
 		}
+	}
+	if !gh.fetched(97) {
+		t.Fatalf("ordinary reviewer-cleanup row did not refetch PR 97; fetched %v", gh.prs)
 	}
 }
 

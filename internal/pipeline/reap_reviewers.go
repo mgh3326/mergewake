@@ -2532,20 +2532,27 @@ func reviewerRow(v reapReceipt) bool {
 }
 
 // reviewerNoRefetch reports whether a receipt must never queue a PR refetch:
-// every reviewer-reap row, and a reviewer-cleanup row that holds a probe cap
-// or a host checkout the sweep has not resolved. The sweep rescans those itself.
+// every reviewer-reap row, and a reviewer-cleanup row that is one of the
+// sweep's holds. The sweep rescans those itself.
 func reviewerNoRefetch(v reapReceipt) bool {
 	if v.Action == "reviewer-reap" {
 		return true
 	}
-	if v.Action != "reviewer-cleanup" {
-		return false
-	}
+	return v.Action == "reviewer-cleanup" && reviewerSweepHold(v.Reason)
+}
+
+// reviewerSweepHold reports whether a pending reason is one of the reviewer
+// sweep's holds: a bounded step the next pass takes. Every reason the sweep
+// writes as a hold is named here, so a new hold is added in one place and
+// never queues a refetch (hk 6993).
+func reviewerSweepHold(reason string) bool {
 	switch {
-	case v.Reason == reviewerLegacyProbeHold,
-		strings.HasPrefix(v.Reason, "host checkout probe cap reached at "),
-		strings.HasPrefix(v.Reason, reviewerHostsPendingPrefix),
-		strings.HasPrefix(v.Reason, reviewerHostsSeveralPrefix):
+	case reason == reviewerLegacyProbeHold,
+		reason == reviewerDrainHold,
+		reason == reviewerBudgetHold,
+		strings.HasPrefix(reason, "host checkout probe cap reached at "),
+		strings.HasPrefix(reason, reviewerHostsPendingPrefix),
+		strings.HasPrefix(reason, reviewerHostsSeveralPrefix):
 		return true
 	}
 	return false
