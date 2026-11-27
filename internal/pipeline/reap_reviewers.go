@@ -228,18 +228,26 @@ func reviewerTerminal(v reapReceipt) bool {
 }
 
 // closeOutcome reports whether a row records the outcome of a close attempt:
-// a close, an abandon error, or a refusal kept for its backoff. A stuck marker
-// never replaces such a row in its stream.
+// a close, an abandon error that carries its backoff deadline, or a refusal
+// kept for its backoff. A stuck marker never replaces such a row in its stream.
+// An abandon error without a deadline (a pane read, or a row an older version
+// wrote) is not kept: a one-off reap must not be blocked by it (hk 6964).
 func closeOutcome(v reapReceipt) bool {
 	switch v.Result {
 	case "closed", "abandoned":
 		return true
 	case "error":
-		return strings.HasPrefix(v.Reason, "abandon job:")
+		return strings.HasPrefix(v.Reason, "abandon job:") && !v.RetryAfter.IsZero()
 	case "kept":
 		return v.Reason == reviewerNotClosable || v.Reason == reviewerOutOfScope
 	}
 	return false
+}
+
+// noCloseAttempt reports whether an abandon error row failed before any close
+// was sent (the pane read, or no owner lane): there is no close to back off.
+func noCloseAttempt(reason string) bool {
+	return strings.HasPrefix(reason, "abandon job: pane read: ") || reason == "abandon job: owner lane unavailable"
 }
 
 // refusalRetries reports how many retries a pending refusal row records: the
@@ -1227,7 +1235,7 @@ func (w *reviewerSweep) abandonSpawned(ctx context.Context, c reviewerCandidate,
 		// stderr, which can change per call. The row carries the id so a
 		// restart restores the same backoff (closeRetryBlocked).
 		key := abandonRetryKey(e)
-		w.s.reapRetryFailed(w.r.Name, l.name, key, reapPass(ctx))
+		gate.RetryAfter = w.s.reapRetryFailed(w.r.Name, l.name, key, reapPass(ctx))
 		gate.RetryKey = key
 		w.record(gate, "error", "abandon job: "+fleetevent.Redact(integrations.Detail(e)))
 		return false
@@ -1281,7 +1289,7 @@ func (w *reviewerSweep) settleScopeForbidden(ctx context.Context, gate reapRecei
 	if w.ownsJob(job) {
 		// The retry key is the failure id (abandonRetryKey), kept on the row.
 		key := abandonRetryKey(closeErr)
-		w.s.reapRetryFailed(w.r.Name, l.name, key, reapPass(ctx))
+		gate.RetryAfter = w.s.reapRetryFailed(w.r.Name, l.name, key, reapPass(ctx))
 		gate.RetryKey = key
 		w.record(gate, "error", "abandon job: "+fleetevent.Redact(integrations.Detail(closeErr)))
 		w.noteScopeForbidden(ctx, l, job, closeErr)
@@ -1434,11 +1442,16 @@ func (w *reviewerSweep) closeRetryBlocked(label string, pass uint64) bool {
 		return true
 	}
 	for _, row := range w.streams[label] {
-		if row.Result == "error" && strings.HasPrefix(row.Reason, "abandon job:") {
+		if row.Result == "error" && strings.HasPrefix(row.Reason, "abandon job:") && !noCloseAttempt(row.Reason) {
 			key := row.RetryKey
 			if key == "" {
 				// A row an older version wrote has no id: its reason is the key.
 				key = strings.TrimPrefix(row.Reason, "abandon job: ")
+			}
+			if !row.RetryAfter.IsZero() {
+				// The row's own deadline governs, as for a kept refusal, so a fresh
+				// one-off reap retries once it has passed (hk 6964).
+				return w.s.reapRetryResume(w.r.Name, label, key, row.RetryAfter)
 			}
 			return w.s.reapRetryRestore(w.r.Name, label, key, pass)
 		}
@@ -1660,7 +1673,7 @@ func (w *reviewerSweep) abandonStuck(ctx context.Context, gate reapReceipt, job 
 		// stderr, which can change per call. The row carries the id so a
 		// restart restores the same backoff (closeRetryBlocked).
 		key := abandonRetryKey(e)
-		w.s.reapRetryFailed(w.r.Name, l.name, key, reapPass(ctx))
+		gate.RetryAfter = w.s.reapRetryFailed(w.r.Name, l.name, key, reapPass(ctx))
 		gate.RetryKey = key
 		w.record(gate, "error", "abandon job: "+fleetevent.Redact(integrations.Detail(e)))
 		return false
@@ -1957,11 +1970,17 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 	switch {
 	case reviewerTerminal(prior) && prior.Result == "kept":
 		return remoteDone
-	case prior.Result == "removed":
-		// The worktree was removed by an earlier pass: the hub is not asked again.
-		return remoteDone
 	case reviewerWaiting(prior, w.now):
 		return remoteStop
+	}
+	if prior.Result == "removed" {
+		// An earlier pass removed this worktree, but a same-label revival can
+		// recreate it at the same path (hk 6964). Only an absent tree is done:
+		// no hub call, no row, no legacy probe. A present tree takes the
+		// guarded path below, pane guard included.
+		if tree, e := hs.ops.Inspect(ctx, cwd); e == nil && tree == nil {
+			return remoteDone
+		}
 	}
 	remover, ok := hs.ops.(interface {
 		WorktreeRemove(context.Context, string, string, string, []string, bool) (reap.WorktreeRemoveResult, error)

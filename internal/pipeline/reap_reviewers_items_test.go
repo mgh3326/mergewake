@@ -152,6 +152,8 @@ func (osRunner) Run(ctx context.Context, name string, args []string, dir, stdin 
 // aged cleanup, and a close still backing off does not hold its checkout.
 func TestReapReviewerAgedLabelCleanupIsNotHeldByCloseBackoff(t *testing.T) {
 	f := newStuckJobFix(t, 25*time.Hour)
+	// A removed worktree is gone from the node, as the real node reports it.
+	f.hub.dropRemoved = true
 	f.hub.jobResult = json.RawMessage(`{"found":true,"completed":false}`)
 	refuseJobClose(f.reviewerFix, jobUnknownStderr(f.label))
 	f.passAfter(t, 0)

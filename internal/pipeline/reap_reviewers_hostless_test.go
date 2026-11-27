@@ -23,6 +23,8 @@ func TestReapReviewerHostlessUniqueHostRemovesWhileADownHostStaysPending(t *test
 	pathA := "/work-a/" + label + reviewerCheckoutSuffix
 	pathB := "/work-b/" + label + reviewerCheckoutSuffix
 	f.hub.detached[pathA] = true
+	// A removed worktree is gone from the node, as the real node reports it.
+	f.hub.dropRemoved = true
 	f.hub.inspectErr = map[string]string{pathB: "node_timeout"}
 	seedDecisionRows(t, f.s, testRepo.Name, map[string]any{"command": "reviewer-held", "value": map[string]any{"pr": 90, "label": label}})
 	if err := f.reap(t, 0, Options{}); err != nil {
@@ -51,8 +53,11 @@ func TestReapReviewerHostlessUniqueHostRemovesWhileADownHostStaysPending(t *test
 		t.Fatalf("pass 2 probed no host; rows %v", rowSummary(f.rows(t)))
 	}
 	for _, p := range probes {
-		if p["cwd"] != pathB {
-			t.Fatalf("pass 2 probed %v, want only %s", p["cwd"], pathB)
+		// pathA's removed row is inspected again, read-only, so a checkout a
+		// revival recreated there is seen (hk 6964); the removal guards still
+		// decide whether anything is removed.
+		if p["cwd"] != pathB && p["cwd"] != pathA {
+			t.Fatalf("pass 2 probed %v, want only %s or %s", p["cwd"], pathB, pathA)
 		}
 	}
 	if removes := f.hub.ops("worktree.remove"); len(removes) != 1 {
