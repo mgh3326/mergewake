@@ -440,7 +440,7 @@ func summarizeLocalDiff(diff string, budget int) (string, []string) {
 		}
 		b.WriteString(headers[i])
 		b.WriteString(elidedNote)
-		fmt.Fprintf(&b, "%x\n", sha256.Sum256([]byte(blocks[i])))
+		fmt.Fprintf(&b, "%x\n", elidedDigest(f))
 		if p := diffFilePath(f); p != "" {
 			summarized = append(summarized, p)
 		}
@@ -513,6 +513,52 @@ func elidedHeader(f diffFile) string {
 		}
 	}
 	return b.String()
+}
+
+// elidedDigest digests the text an elided block still stands for. It keeps the
+// file headers and every changed line (+, - and the "\ No newline" marker), the
+// text the strict patch hash covers. It keeps where the changes sit, but not
+// the context text: each run of unchanged lines is written as its length, so a
+// change that moves within a hunk changes the digest, while a base merge that
+// only rewrites context text or line numbers does not. The index line (blob
+// ids, which a base merge moves) and hunk headers are left out.
+func elidedDigest(f diffFile) [sha256.Size]byte {
+	var b strings.Builder
+	for _, line := range f.head {
+		if strings.HasPrefix(line, "index ") {
+			continue
+		}
+		b.WriteString(withNewline(line))
+	}
+	for _, h := range f.hunks {
+		run := 0
+		for _, line := range h.lines {
+			switch {
+			case strings.HasPrefix(line, "@@"):
+				continue
+			case line != "" && (line[0] == '+' || line[0] == '-' || line[0] == '\\'):
+				if run > 0 {
+					fmt.Fprintf(&b, "unchanged %d\n", run)
+					run = 0
+				}
+				b.WriteString(withNewline(line))
+			default:
+				run++
+			}
+		}
+		if run > 0 {
+			fmt.Fprintf(&b, "unchanged %d\n", run)
+		}
+		b.WriteString("hunk end\n")
+	}
+	return sha256.Sum256([]byte(b.String()))
+}
+
+func withNewline(line string) string {
+	if strings.HasSuffix(line, "\n") {
+		return line
+	}
+	return line + "\n"
 }
 
 // diffFilePath is the new-side path, or the old one for a deletion, or the

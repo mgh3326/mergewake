@@ -19,7 +19,7 @@ func TestReapReviewerRemovedRowDoesNotHideRecreatedCheckout(t *testing.T) {
 		host := f.s.Config.Hosts[0].Name
 		f.sink.recs[label] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: label, Host: host}
 		seedReapRows(t, f.s, testRepo.Name,
-			reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: 12, Host: host, Pane: "w1:p5", Label: label,
+			reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: 12, Host: host, Pane: "fixture-pane-a", Label: label,
 				Result: "pending-cleanup", Reason: "pane still present; panewire closes it and a later sweep cleans up"},
 			reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: 12, Host: host, Label: label, Worktree: path, Cwd: path,
 				Result: "removed"},
@@ -48,7 +48,7 @@ func TestReapReviewerRemovedRowDoesNotHideRecreatedCheckout(t *testing.T) {
 		f := newReviewerFix(t)
 		seed(f)
 		f.hub.detached[path] = true
-		f.addPane("w1:p8", "other", path)
+		f.addPane("fixture-pane-b", "other", path)
 		if err := f.reap(t, 0, Options{}); err != nil {
 			t.Fatal(err)
 		}
@@ -86,9 +86,9 @@ func TestReapReviewerAbandonErrorRowDoesNotBlockFreshReaps(t *testing.T) {
 	f.clearPanes()
 	host := f.s.Config.Hosts[0].Name
 	seedReapRows(t, f.s, testRepo.Name,
-		reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: 12, Host: host, Pane: "w1:p5", Label: f.label,
+		reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: 12, Host: host, Pane: "fixture-pane-a", Label: f.label,
 			Result: "error", Reason: "abandon job: panewire exit status 5 owner_mismatch", RetryAfter: reviewerNow.Add(-time.Hour)},
-		reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: 12, Host: host, Pane: "w1:p5", Label: f.label,
+		reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: 12, Host: host, Pane: "fixture-pane-a", Label: f.label,
 			Result: "stuck-reviewer", Reason: "job spawned with no result"},
 	)
 
