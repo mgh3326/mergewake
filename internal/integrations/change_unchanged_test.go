@@ -1,6 +1,7 @@
 package integrations
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
@@ -60,7 +61,7 @@ func TestHKChangeFailedWriteForgetsRecordedValue(t *testing.T) {
 	key := changeKey{"o/r", 7}
 	w.Queue("o/r", 7, "checks", checks(base, "abc"))
 	drainChange(t, w)
-	if w.sent[key]["checks"] == "" {
+	if w.sent[key]["checks"].key == "" {
 		t.Fatal("a finished write records its section's value")
 	}
 	// hk refuses the next write, so the flush does not finish.
@@ -69,7 +70,76 @@ func TestHKChangeFailedWriteForgetsRecordedValue(t *testing.T) {
 	f.mu.Unlock()
 	w.Queue("o/r", 7, "checks", checks(base.Add(time.Second), "def"))
 	drainChange(t, w)
-	if got := w.sent[key]["checks"]; got != "" {
+	if got := w.sent[key]["checks"].key; got != "" {
 		t.Fatalf("a failed write still records %q", got)
+	}
+}
+
+// An unchanged section is written again once its last write is a refresh
+// interval old, so hk's freshness mark follows the newer observation.
+func TestHKChangeUnchangedSectionRefreshesAfterInterval(t *testing.T) {
+	f := &changeFake{}
+	w, _ := changeTestWriter(t, f)
+	w.outbox = filepath.Join(t.TempDir(), "outbox")
+	base := time.Now().UTC()
+	clock := base
+	w.now = func() time.Time { return clock }
+	checks := func(at time.Time) ChangeSection {
+		return ChangeSection{At: at, Value: map[string]any{"head_sha": "abc", "checks": []string{"lint ok"}, "observed_at": at, "source": "poll", "complete": true}}
+	}
+	w.Queue("o/r", 7, "checks", checks(base))
+	drainChange(t, w)
+
+	later := base.Add(changeRefreshInterval)
+	clock = later
+	w.Queue("o/r", 7, "checks", checks(later))
+	drainChange(t, w)
+
+	f.mu.Lock()
+	batches := f.batches
+	f.mu.Unlock()
+	if len(batches) != 2 {
+		t.Fatalf("batches after the refresh interval = %d, want 2", len(batches))
+	}
+	var sent map[string]json.RawMessage
+	if err := json.Unmarshal(batches[1]["checks"], &sent); err != nil {
+		t.Fatal(err)
+	}
+	want, _ := json.Marshal(later)
+	if got := string(sent["observed_at"]); got != string(want) {
+		t.Fatalf("refreshed observed_at = %s, want %s", got, want)
+	}
+	if got := w.Counts().Unchanged; got != 0 {
+		t.Fatalf("unchanged after a refresh = %d, want 0", got)
+	}
+}
+
+// An unchanged section inside the refresh interval is skipped as before.
+func TestHKChangeUnchangedSectionSkippedInsideInterval(t *testing.T) {
+	f := &changeFake{}
+	w, _ := changeTestWriter(t, f)
+	w.outbox = filepath.Join(t.TempDir(), "outbox")
+	base := time.Now().UTC()
+	clock := base
+	w.now = func() time.Time { return clock }
+	checks := func(at time.Time) ChangeSection {
+		return ChangeSection{At: at, Value: map[string]any{"head_sha": "abc", "checks": []string{"lint ok"}, "observed_at": at, "source": "poll", "complete": true}}
+	}
+	w.Queue("o/r", 7, "checks", checks(base))
+	drainChange(t, w)
+
+	inside := base.Add(changeRefreshInterval - time.Second)
+	clock = inside
+	w.Queue("o/r", 7, "checks", checks(inside))
+	drainChange(t, w)
+
+	f.mu.Lock()
+	writes := f.requests
+	f.mu.Unlock()
+	if writes != 1 {
+		t.Fatalf("batch writes inside the refresh interval = %d, want 1", writes)
+	}
+	if got := w.Counts().Unchanged; got != 1 {
+		t.Fatalf("unchanged sections = %d, want 1", got)
 	}
 }

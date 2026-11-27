@@ -35,6 +35,16 @@ type changeKey struct {
 	repo string
 	pr   int
 }
+
+// sentValue is a section's sectionKey and the time it was last written.
+type sentValue struct {
+	key string
+	at  time.Time
+}
+
+// changeRefreshInterval is the longest an unchanged section goes unwritten.
+const changeRefreshInterval = 10 * time.Minute
+
 type changePending struct {
 	sections map[string]ChangeSection
 	findings []ChangeSection
@@ -49,8 +59,13 @@ type ChangeWriter struct {
 	sendMu  sync.Mutex
 	pending map[changeKey]*changePending
 	// sent holds, per change and section, the sectionKey of the value last
-	// written for it in this process; sendMu guards it.
-	sent                                 map[changeKey]map[string]string
+	// written for it in this process and when it was written; sendMu guards it.
+	sent map[changeKey]map[string]sentValue
+	// refresh bounds how long an unchanged section is held back: once its last
+	// write is this old, the same value is written again so hk's freshness
+	// mark follows what was observed. now is the clock; tests replace both.
+	refresh                              time.Duration
+	now                                  func() time.Time
 	outbox                               string
 	seen                                 map[string]bool
 	retryTimer                           *time.Timer
@@ -71,7 +86,7 @@ func NewChangeWriter(log *slog.Logger, stateDir ...string) *ChangeWriter {
 	if log == nil {
 		log = slog.Default()
 	}
-	w := &ChangeWriter{endpoint: hkJobEndpoint, log: log}
+	w := &ChangeWriter{endpoint: hkJobEndpoint, log: log, refresh: changeRefreshInterval, now: time.Now}
 	if len(stateDir) > 0 && stateDir[0] != "" {
 		w.outbox = filepath.Join(stateDir[0], "hk-change-outbox")
 		w.reload()
@@ -181,8 +196,9 @@ func (w *ChangeWriter) flush() {
 		b := ChangeBatch{Repo: k.repo, PR: k.pr}
 		for name, s := range p.sections {
 			key := sectionKey(s.Value)
-			if last[name] == key {
-				// The change's value is what this process last wrote for it.
+			// The change's value is what this process last wrote for it, and
+			// that write is recent: hk's freshness mark is not behind it.
+			if v, ok := last[name]; ok && v.key == key && w.now().Sub(v.at) < w.refresh {
 				w.unchanged.Add(1)
 				continue
 			}
@@ -271,12 +287,15 @@ func (w *ChangeWriter) noteSent(k changeKey, keys map[string]string, stale map[s
 		return
 	}
 	if w.sent == nil {
-		w.sent = map[changeKey]map[string]string{}
+		w.sent = map[changeKey]map[string]sentValue{}
 	}
 	if w.sent[k] == nil {
-		w.sent[k] = map[string]string{}
+		w.sent[k] = map[string]sentValue{}
 	}
-	maps.Copy(w.sent[k], keys)
+	at := w.now()
+	for name, key := range keys {
+		w.sent[k][name] = sentValue{key: key, at: at}
+	}
 }
 
 // changeChecksPerRequest bounds the checks one request carries; hk takes at
