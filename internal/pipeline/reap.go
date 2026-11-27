@@ -618,6 +618,24 @@ func (s *Service) reapRetryRestore(repo, job, failure string, pass uint64) bool 
 	return true
 }
 
+// reapRetryResume restores a failed close's backoff from its durable row, whose
+// deadline governs (hk 6964): a passed deadline lets this pass retry, and the
+// restored key keeps the attempt count going on the next failure. It reports
+// whether the close is still backed off.
+func (s *Service) reapRetryResume(repo, job, failure string, until time.Time) bool {
+	state := s.reapState()
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.retries == nil {
+		state.retries = map[string]reapRetry{}
+	}
+	k := repo + "\x00" + job
+	if _, ok := state.retries[k]; !ok {
+		state.retries[k] = reapRetry{failure: failure, attempts: 1, retryAt: until}
+	}
+	return s.now().Before(until)
+}
+
 func (s *Service) reapRetrySucceeded(repo, job string) {
 	state := s.reapState()
 	state.mu.Lock()
