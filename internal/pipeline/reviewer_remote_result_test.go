@@ -129,6 +129,43 @@ func TestReviewerRemoteResultTimeoutPreservesBudget(t *testing.T) {
 	}
 }
 
+// deadlineRecordingPanewire records the deadline of the job-result lookup's
+// context and fails it at once, so the lookup returns without waiting.
+type deadlineRecordingPanewire struct {
+	*panewireRunner
+	deadline time.Time
+	ok       bool
+}
+
+func (r *deadlineRecordingPanewire) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	if command == "panewire" && len(args) > 1 && args[0] == "node" && args[1] == "job-result" {
+		r.deadline, r.ok = ctx.Deadline()
+		return nil, errors.New("job-result unavailable")
+	}
+	return r.panewireRunner.Run(ctx, command, args, input, dir)
+}
+
+// The lookup's own cap is a minute, which exceeds half of the one minute left
+// on the parent, so the lookup must be clamped to half the parent's remaining time.
+func TestReviewerRemoteResultLookupClampedToHalfParentBudget(t *testing.T) {
+	runner := &panewireRunner{}
+	s, _, repo := panewireSetup(t, runner)
+	rec := &deadlineRecordingPanewire{panewireRunner: runner}
+	s.Runner = rec
+	x := panewireExecutor{s: s, repo: repo}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	parent, _ := ctx.Deadline()
+	start := time.Now()
+	x.remoteFindingsWithTimeout(ctx, &passPlan{pass: 1}, integrations.JobRecord{Host: "local"}, "job", time.Minute)
+	if !rec.ok {
+		t.Fatal("the job-result lookup ran without a deadline")
+	}
+	if limit := start.Add(parent.Sub(start)/2 + time.Second); rec.deadline.After(limit) {
+		t.Fatalf("lookup deadline %s is past half the parent budget (limit %s)", rec.deadline, limit)
+	}
+}
+
 func TestReviewerRemoteResultTransientRetry(t *testing.T) {
 	s, g, repo, runner, c := interruptedReviewer(t)
 	old := readReviewerJob(t, s, repo, 1)
