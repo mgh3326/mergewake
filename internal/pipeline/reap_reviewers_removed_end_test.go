@@ -186,3 +186,110 @@ func TestReapReviewerHeldRecreatedCheckoutKeepsProof(t *testing.T) {
 		t.Fatalf("held recreated checkout removed as a plain removal: %v", rowSummary(rows))
 	}
 }
+
+// A due stream whose first re-inspect fails is retried on the next pass, though it
+// is not the one the job names (review 4715911271, 4715911423). Fails without the
+// removed-proof selection in removeDueRemoved.
+func TestReapReviewerDueStreamFailureIsRetriedNextPass(t *testing.T) {
+	pr := 12
+	label := reviewerLabelFor(pr, time.Hour)
+	spec := "/work/" + label + reviewerCheckoutSuffix
+	legacy := "/work/" + label
+	f := removedEndFix(t, pr, label, spec)
+	host := f.s.Config.Hosts[0].Name
+	seedReapRows(t, f.s, testRepo.Name, append(removedStreamRows(pr, label, spec, host),
+		reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: pr, Host: host, Label: label,
+			Worktree: legacy, Cwd: legacy, Result: "skipped", Reason: "already gone: removed path re-inspected with no tree; inspected again later (2025-01-01T00:00:00Z)"})...)
+	f.hub.detached[legacy] = true
+	f.hub.inspectErr = map[string]string{legacy: "timeout"}
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	f.hub.inspectErr = nil
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range f.hub.ops("worktree.remove") {
+		if op["cwd"] == legacy {
+			return
+		}
+	}
+	t.Fatalf("failed due stream was not retried next pass: removes %v, rows %v", f.hub.ops("worktree.remove"), rowSummary(f.rows(t)))
+}
+
+// Unreachable nodes say nothing about a removed path, so they do not count toward
+// its three attempts (review 4715911276, 4715911430). Fails when they do.
+func TestReapReviewerUnreachableInspectsDoNotSettleRemovedPath(t *testing.T) {
+	pr := 12
+	label := reviewerLabelFor(pr, time.Hour)
+	path := "/work/" + label + reviewerCheckoutSuffix
+	f := removedEndFix(t, pr, label, path)
+	f.hub.detached[path] = true
+	f.hub.inspectErr = map[string]string{path: "node_lost"}
+	for range 4 {
+		if err := f.reap(t, 0, Options{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rows := f.rows(t)
+	if n := countRows(rows, path, "removed path re-inspect failed"); n != 0 {
+		t.Fatalf("unreachable node settled the removed path: %v", rowSummary(rows))
+	}
+	f.hub.inspectErr = nil
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	removes := f.hub.ops("worktree.remove")
+	if len(removes) != 1 || removes[0]["cwd"] != path {
+		t.Fatalf("recovered node did not remove the checkout: %v (rows %v)", removes, rowSummary(f.rows(t)))
+	}
+}
+
+// The legacy path's own absent answer stands for a day after the fallback switch
+// too: a pass inside that day inspects nothing (review 4715911281, 4715911433).
+// Fails without the absent-settled check after the switch.
+func TestReapReviewerLegacyAbsentAnswerStandsForADay(t *testing.T) {
+	pr := 12
+	label := reviewerLabelFor(pr, time.Hour)
+	spec := "/work/" + label + reviewerCheckoutSuffix
+	legacy := "/work/" + label
+	f := newReviewerFix(t)
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	host := f.s.Config.Hosts[0].Name
+	f.sink.recs[label] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: label, Host: host, Cwd: spec}
+	seedReapRows(t, f.s, testRepo.Name, append(removedStreamRows(pr, label, spec, host)[:1],
+		reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: pr, Host: host, Label: label, Time: reviewerNow,
+			Worktree: legacy, Cwd: legacy, Result: "skipped", Reason: reviewerRemovedAbsentReason(reviewerNow)})...)
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if n := inspectsOf(f, legacy); n != 0 {
+		t.Fatalf("legacy path re-inspected inside the day after its absent answer: %d inspects", n)
+	}
+}
+
+// A pending hub refusal keeps its retry count when its re-inspect fails, so the
+// final refusal is not postponed (review 4715911286). Fails when the failed probe
+// overwrites the refusal row with the reprobe marker.
+func TestReapReviewerRefusedRemovalKeepsRetryAcrossFailedProbe(t *testing.T) {
+	pr := 12
+	label := reviewerLabelFor(pr, time.Hour)
+	path := "/work/" + label + reviewerCheckoutSuffix
+	f := newReviewerFix(t)
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	host := f.s.Config.Hosts[0].Name
+	f.sink.recs[label] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: label, Host: host}
+	refusal := "hub guarded removal refused: worktree dirty (retry 1 of 3)"
+	seedReapRows(t, f.s, testRepo.Name, append(removedStreamRows(pr, label, path, host)[:1],
+		reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: pr, Host: host, Label: label, Worktree: path, Cwd: path,
+			Result: "pending-cleanup", Reason: refusal, Recreated: true})...)
+	f.hub.detached[path] = true
+	f.hub.inspectErr = map[string]string{path: "timeout"}
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	rows := f.rows(t)
+	if last := rows[len(rows)-1]; last.Worktree != path || last.Reason != refusal {
+		t.Fatalf("refusal retry count lost after a failed probe: %v", rowSummary(rows))
+	}
+}
