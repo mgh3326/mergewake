@@ -1825,14 +1825,14 @@ func (w *reviewerSweep) removeUnrecorded(ctx context.Context, l reviewerLabel, c
 // hosts a pass left uncertain. It reports false when the visit ends here.
 func (w *reviewerSweep) discoverUnrecorded(ctx context.Context, l reviewerLabel, only map[string]bool) bool {
 	prior := w.ambiguousCopies(l)
-	found, uncertain, blocked, capped, copies := w.findUnrecordedCheckout(ctx, l, only)
+	found, uncertain, blocked, capped, copies, unreached := w.findUnrecordedCheckout(ctx, l, only)
 	switch {
 	case len(copies) > 1 || (len(prior) > 0 && (len(uncertain) > 0 || blocked)):
 		// Two or more reachable hosts hold a checkout, or a label that was
 		// ambiguous has a host that still cannot answer: which copy is the
 		// spawn's is not known, so nothing is removed. The label stays pending
 		// and names the hosts holding a copy and the named hosts still unanswered.
-		w.recordSeveral(l, w.ambiguousNames(prior, copies, uncertain), len(uncertain) > 0)
+		w.recordSeveral(l, w.ambiguousNames(prior, copies, uncertain), len(unreached) > 0)
 	case found != nil && !blocked:
 		// Exactly one reachable host holds the checkout, and the only doubt is
 		// hosts that failed or have no work root: the checkout is removed there.
@@ -2041,9 +2041,9 @@ func (w *reviewerSweep) settleHostlessStream(l reviewerLabel) {
 // even when several copies were found. The host-less probes have their own
 // allowance, so they never take the legacy-path probes' share. Dry runs probe
 // nothing.
-func (w *reviewerSweep) findUnrecordedCheckout(ctx context.Context, l reviewerLabel, only map[string]bool) (found *reapHost, uncertain []string, blocked bool, capped string, copies []string) {
+func (w *reviewerSweep) findUnrecordedCheckout(ctx context.Context, l reviewerLabel, only map[string]bool) (found *reapHost, uncertain []string, blocked bool, capped string, copies, unreached []string) {
 	if !w.acting {
-		return nil, nil, false, "", nil
+		return nil, nil, false, "", nil, nil
 	}
 	take := w.takeHostlessProbe
 	if w.ambiguousCopies(l) != nil {
@@ -2056,9 +2056,12 @@ func (w *reviewerSweep) findUnrecordedCheckout(ctx context.Context, l reviewerLa
 		path := reviewerWorktreePath(hs, l)
 		if path == "" || hs.failed {
 			uncertain = append(uncertain, hs.host.Name)
+			unreached = append(unreached, hs.host.Name)
 			continue
 		}
 		if !take(hs.host.Name) {
+			// A probe cap is not a failed host: it holds the label pending
+			// without starting the bound a failed host starts.
 			uncertain = append(uncertain, hs.host.Name)
 			blocked = true
 			if capped == "" {
@@ -2069,6 +2072,7 @@ func (w *reviewerSweep) findUnrecordedCheckout(ctx context.Context, l reviewerLa
 		tree, err := hs.ops.Inspect(ctx, path)
 		if err != nil {
 			uncertain = append(uncertain, hs.host.Name)
+			unreached = append(unreached, hs.host.Name)
 			if isHostUnreachable(err) {
 				hs.failed = true
 			} else {
@@ -2084,7 +2088,7 @@ func (w *reviewerSweep) findUnrecordedCheckout(ctx context.Context, l reviewerLa
 	if len(copies) != 1 {
 		found = nil
 	}
-	return found, uncertain, blocked, capped, copies
+	return found, uncertain, blocked, capped, copies, unreached
 }
 
 // takeAmbiguousProbe spends one host's probe for a revisit of an ambiguous

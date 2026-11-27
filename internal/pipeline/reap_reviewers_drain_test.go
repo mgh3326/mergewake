@@ -804,7 +804,7 @@ func TestReapReviewerHostlessProbeUsesVisitContext(t *testing.T) {
 	hs := &reapHost{host: reap.Host{Name: "node", Machine: "node-a", WorkRoot: "/work"}, ops: ops}
 	w := &reviewerSweep{hosts: []*reapHost{hs}, acting: true}
 	label, _ := parseReviewerLabel(reviewerLabelFor(68, 2*24*time.Hour))
-	_, uncertain, blocked, _, _ := w.findUnrecordedCheckout(ctx, label, nil)
+	_, uncertain, blocked, _, _, _ := w.findUnrecordedCheckout(ctx, label, nil)
 	if (len(uncertain) == 0 && !blocked) || ops.got != ctx {
 		t.Fatalf("discovery did not use the canceled visit context: uncertain=%v blocked=%t got=%v want=%v", uncertain, blocked, ops.got, ctx)
 	}
