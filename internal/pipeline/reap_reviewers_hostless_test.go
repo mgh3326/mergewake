@@ -66,8 +66,10 @@ func TestReapReviewerHostlessUniqueHostRemovesWhileADownHostStaysPending(t *test
 }
 
 // A host-less label whose only unanswered host is still down settles terminal
-// once its spawn is older than the bounded wait, and the row names the host
-// that was never probed.
+// once that host has been down for the bounded wait, and the row names the
+// host that was never probed. The wait counts from the first pass that found
+// the host down, not from the spawn, so the first failed pass only keeps the
+// label pending.
 func TestReapReviewerHostlessDownHostSettlesTerminalAfterTheBoundedWait(t *testing.T) {
 	f := newReviewerFix(t, reap.Host{Name: "node-b", Machine: "node-b", WorkRoot: "/work-b"}, reap.Host{Name: "node-c", Machine: "node-c", WorkRoot: "/work-c"})
 	f.s.Config.Hosts[0].WorkRoot = "/work-a"
@@ -82,9 +84,19 @@ func TestReapReviewerHostlessDownHostSettlesTerminalAfterTheBoundedWait(t *testi
 		t.Fatal(err)
 	}
 	rows := f.rows(t)
+	if len(rows) != 1 || rows[0].Result != "pending-cleanup" || rows[0].Reason != hostsPendingReason([]string{"node-b"}) {
+		t.Fatalf("first failed pass rows %v, want one pending row owing node-b", rowSummary(rows))
+	}
+
+	// Past the bound, counted from that first failed pass, the label settles.
+	f.s.Now = func() time.Time { return reviewerNow.Add(reviewerHostlessMaxAge + time.Hour) }
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	rows = f.rows(t)
 	want := reviewerHostUnknown + reviewerHostUnprobed + "node-b"
-	if len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != want {
-		t.Fatalf("rows %v, want one kept row %q", rowSummary(rows), want)
+	if len(rows) != 2 || rows[1].Result != "kept" || rows[1].Reason != want {
+		t.Fatalf("rows %v, want a kept row %q after the bound", rowSummary(rows), want)
 	}
 	nrows := len(rows)
 	if err := f.reap(t, 0, Options{}); err != nil {

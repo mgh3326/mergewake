@@ -56,6 +56,11 @@ type reapReceipt struct {
 	// RetryAfter is the deadline of a kept not-closable row's backoff. A later
 	// invocation, a fresh process, retries once it has passed (hk 6014).
 	RetryAfter time.Time `json:"retry_after,omitzero"`
+
+	// FailedSince is when the unanswered hosts of a host-less label first
+	// failed, on the pending row that keeps the label open. The sweep's bounded
+	// wait for those hosts counts from it, so one failed pass never settles it.
+	FailedSince time.Time `json:"failed_since,omitzero"`
 }
 
 func worktreeRemoveVerdict(v reap.WorktreeRemoveResult) (result, reason string) {
@@ -285,11 +290,18 @@ func reapRowKey(v reapReceipt) string {
 // reapRowSig names a row's result and reason. A kept not-closable row also
 // names its backoff deadline: a refusal that repeats moves the deadline out, and
 // that new deadline is state a later invocation must read, not a repeat (hk 6014).
+// A host-less pending row's FailedSince is the same kind of state: setting,
+// keeping or clearing it is a change a later pass reads, so it is part of the
+// signature too (hk 6969).
 func reapRowSig(v reapReceipt) string {
-	if v.RetryAfter.IsZero() {
-		return v.Result + "|" + v.Reason
+	sig := v.Result + "|" + v.Reason
+	if !v.RetryAfter.IsZero() {
+		sig += "|" + v.RetryAfter.UTC().Format(time.RFC3339Nano)
 	}
-	return v.Result + "|" + v.Reason + "|" + v.RetryAfter.UTC().Format(time.RFC3339Nano)
+	if !v.FailedSince.IsZero() {
+		sig += "|failed-since " + v.FailedSince.UTC().Format(time.RFC3339Nano)
+	}
+	return sig
 }
 
 // terminalWorktreeSig reports whether a worktree's latest row is a terminal

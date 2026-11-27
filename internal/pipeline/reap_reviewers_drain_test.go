@@ -595,7 +595,7 @@ func TestReapReviewerAgedLabelWithoutAHostSettlesTerminal(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows := f.rows(t)
-	if len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != reviewerHostUnknown {
+	if len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != reviewerHostlessNoCopy {
 		t.Fatalf("rows: %v", rowSummary(rows))
 	}
 	nrows := len(f.rows(t))
@@ -647,7 +647,7 @@ func TestReapReviewerHostlessCheckoutAbsentOrAmbiguousStaysBoundedAndKeepsCopies
 			rows := f.rows(t)
 			// Absent: the label is terminal at once. Ambiguous: the copies on
 			// both hosts are kept and the label stays pending, not terminal.
-			want := reviewerHostUnknown
+			want := reviewerHostlessNoCopy
 			result := "kept"
 			if tc.onBoth {
 				want = reviewerHostsSeveralPrefix + f.s.Config.Hosts[0].Name + ", node-b"
@@ -804,7 +804,7 @@ func TestReapReviewerHostlessProbeUsesVisitContext(t *testing.T) {
 	hs := &reapHost{host: reap.Host{Name: "node", Machine: "node-a", WorkRoot: "/work"}, ops: ops}
 	w := &reviewerSweep{hosts: []*reapHost{hs}, acting: true}
 	label, _ := parseReviewerLabel(reviewerLabelFor(68, 2*24*time.Hour))
-	_, uncertain, blocked, _, _ := w.findUnrecordedCheckout(ctx, label, nil)
+	_, uncertain, blocked, _, _, _ := w.findUnrecordedCheckout(ctx, label, nil)
 	if (len(uncertain) == 0 && !blocked) || ops.got != ctx {
 		t.Fatalf("discovery did not use the canceled visit context: uncertain=%v blocked=%t got=%v want=%v", uncertain, blocked, ops.got, ctx)
 	}
