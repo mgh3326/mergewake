@@ -193,6 +193,24 @@ func baseDropRepo(t *testing.T, mode string) (root, base, head string) {
 		tree := baseDropGit(t, src, "write-tree")
 		later := baseDropGit(t, src, "commit-tree", tree, "-p", "HEAD", "-p", base, "-m", "later merge of base")
 		baseDropGit(t, src, "reset", "--hard", later)
+	case "rename_merge_into_dir_carried", "rename_merge_into_dir_drop":
+		// The feature moves the file into a directory of the same name
+		// (x -> x/y), so the base-side path is a directory at head. A merge
+		// keeps the moved side and loses the base's added line. The head
+		// either carries that line under x/y or does not carry it at all.
+		baseDropGit(t, src, "mv", "tracked.txt", "moved.txt")
+		if err := os.Mkdir(filepath.Join(src, "tracked.txt"), 0700); err != nil {
+			t.Fatal(err)
+		}
+		baseDropGit(t, src, "mv", "moved.txt", "tracked.txt/y.txt")
+		baseDropGit(t, src, "commit", "-m", "move file into a directory of the same name")
+		baseDropGit(t, src, "merge", "--no-ff", "-s", "ours", "main", "-m", "drop base addition")
+		if mode == "rename_merge_into_dir_carried" {
+			if err := os.WriteFile(filepath.Join(src, "tracked.txt", "y.txt"), []byte(renameFork+"base addition\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			baseDropGit(t, src, "commit", "-am", "restore base line under the moved path")
+		}
 	case "rename_merge_drop", "rename_merge_carried", "rename_merge_later_carried", "rename_merge_restored_original", "rename_merge_split":
 		// The feature renames the file and a merge keeps the renamed side, which
 		// loses the base's added line. The head either carries that line under
@@ -284,6 +302,12 @@ func TestGateBaseChangeDropped(t *testing.T) {
 		{mode: "rename_merge_split", want: "base_change_dropped:1"},
 		// The rename is real and the head does not carry the line: a drop.
 		{mode: "rename_merge_drop", want: "base_change_dropped:1"},
+		// The file moves into a directory of its own name (x -> x/y), so the
+		// base-side path is a directory at head. The head carries the line under
+		// x/y, so it reaches a verdict with no drop (hk 7041).
+		{mode: "rename_merge_into_dir_carried", want: ""},
+		// The same move, and the head does not carry the line: a drop.
+		{mode: "rename_merge_into_dir_drop", want: "base_change_dropped:1"},
 		{mode: "no_merge", want: ""},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
@@ -312,6 +336,13 @@ func TestGateBaseChangeDropped(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Fatalf("base-drop reason = %q, want %q; all reasons=%v", got, tc.want, v.Reasons)
+			}
+			// A verification error also yields no drop reason, so a verdict
+			// must be checked directly: the change is decided, not unverified.
+			for _, reason := range v.Reasons {
+				if strings.HasPrefix(reason, "base_drop_unverified:") {
+					t.Fatalf("base-drop check did not reach a verdict: reasons=%v", v.Reasons)
+				}
 			}
 			if tc.mode == "drop" && (v.State != "blocked" || len(v.BaseChangesDropped) != 1 || v.BaseChangesDropped[0] == "") {
 				t.Fatalf("dropped base change verdict = %+v", v)
