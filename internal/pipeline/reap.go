@@ -61,6 +61,15 @@ type reapReceipt struct {
 	// failed, on the pending row that keeps the label open. The sweep's bounded
 	// wait for those hosts counts from it, so one failed pass never settles it.
 	FailedSince time.Time `json:"failed_since,omitzero"`
+
+	// Recreated marks a reviewer stream whose checkout a same-label revival
+	// recreated at a removed path. It is carried by the rows that hold the
+	// stream before its removal, so the removal is still recorded as one (hk 7019).
+	Recreated bool `json:"recreated,omitempty"`
+	// Reinspects counts the re-inspects of a removed path since its removal
+	// that answered absent or failed. The last of reviewerRemovedAttempts
+	// settles the stream (hk 7019).
+	Reinspects int `json:"reinspects,omitempty"`
 }
 
 func worktreeRemoveVerdict(v reap.WorktreeRemoveResult) (result, reason string) {
@@ -300,6 +309,11 @@ func reapRowSig(v reapReceipt) string {
 	}
 	if !v.FailedSince.IsZero() {
 		sig += "|failed-since " + v.FailedSince.UTC().Format(time.RFC3339Nano)
+	}
+	// A removed path's count and its recreated proof are state a later pass
+	// reads, so a row that changes either is not a repeat (hk 7019).
+	if v.Recreated || v.Reinspects > 0 {
+		sig += fmt.Sprintf("|recreated=%t reinspects=%d", v.Recreated, v.Reinspects)
 	}
 	return sig
 }

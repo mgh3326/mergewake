@@ -230,6 +230,17 @@ const (
 	// reviewerAlreadyGone, so it does not count as a removal again.
 	reviewerRemovedAbsent      = "already gone: removed path re-inspected with no tree; inspected again later"
 	reviewerRemovedAbsentAfter = 24 * time.Hour
+	// reviewerRemovedAttempts bounds the re-inspects of a removed path after its
+	// removal, absent answers and failed inspects alike (hk 7019). The last one
+	// settles the stream with a terminal row, which is never due again.
+	reviewerRemovedAttempts = 3
+	// reviewerRemovedSettled prefixes the terminal row of a removed path that
+	// was re-inspected reviewerRemovedAttempts times with no tree. It does not
+	// start with reviewerRemovedAbsent, so nothing re-admits the stream.
+	reviewerRemovedSettled = "already gone: removed path absent on "
+	// reviewerRemovedUnreadable prefixes the terminal row of a removed path whose
+	// re-inspects all failed; the row names the last error.
+	reviewerRemovedUnreadable = "removed path re-inspect failed "
 	// reviewerHostlessProbesPerHost bounds the probes of a host-less label's
 	// checkout path per host and pass. It is its own allowance, so a backlog of
 	// host-less labels never takes the legacy-path probes' share.
@@ -254,7 +265,7 @@ func reviewerTerminal(v reapReceipt) bool {
 	case "closed", "removed":
 		return true
 	case "skipped":
-		return strings.Contains(v.Reason, "already gone") || strings.HasPrefix(v.Reason, reviewerOtherRepo) || v.Reason == reviewerHostDiscovered
+		return strings.Contains(v.Reason, "already gone") || strings.HasPrefix(v.Reason, reviewerRemovedUnreadable) || strings.HasPrefix(v.Reason, reviewerOtherRepo) || v.Reason == reviewerHostDiscovered
 	case "kept":
 		return v.Worktree != "" && (strings.HasPrefix(v.Reason, reviewerHostUnknown) || strings.HasPrefix(v.Reason, reviewerRefused))
 	}
@@ -312,6 +323,21 @@ func reviewerReprobe(v reapReceipt) bool {
 		(v.Result == "skipped" && strings.HasPrefix(v.Reason, reviewerRemovedAbsent))
 }
 
+// reviewerRecreatedProof reports whether a stream's newest row keeps the removed
+// proof: a removal, a held or failed re-inspect, an absent answer, or a row that
+// holds a tree a re-inspect found (hk 7019).
+func reviewerRecreatedProof(v reapReceipt) bool {
+	return v.Result == "removed" || reviewerReprobe(v) || v.Recreated
+}
+
+// markStepped names a label stream removeRemote handled this pass.
+func (w *reviewerSweep) markStepped(label, key string) {
+	if w.stepped == nil {
+		w.stepped = map[string]bool{}
+	}
+	w.stepped[label+"\x00"+key] = true
+}
+
 // reviewerRemovedAbsentReason is the reason of an absent answer at instant now.
 // Each answer carries its instant, so a later absent answer is a new row: an
 // identical reason would be dropped as a repeat and the stream would never
@@ -324,6 +350,12 @@ func reviewerRemovedAbsentReason(now time.Time) string {
 // tree is not due for another inspect yet.
 func reviewerAbsentSettled(v reapReceipt, now time.Time) bool {
 	return v.Result == "skipped" && strings.HasPrefix(v.Reason, reviewerRemovedAbsent) && now.Sub(v.Time) < reviewerRemovedAbsentAfter
+}
+
+// reviewerRemovedDone reports whether a removed path's newest row is its settled
+// end: its re-inspects are spent, and no later pass inspects it (hk 7019).
+func reviewerRemovedDone(v reapReceipt) bool {
+	return v.Result == "skipped" && (strings.HasPrefix(v.Reason, reviewerRemovedSettled) || strings.HasPrefix(v.Reason, reviewerRemovedUnreadable))
 }
 
 // reviewerLabelOf names the label a reviewer receipt is about. A
@@ -389,6 +421,9 @@ type reviewerSweep struct {
 	// removedProbes is the re-inspects of removed paths each host took this
 	// pass, its own allowance apart from legacyProbes (hk 6992).
 	removedProbes map[string]int
+	// stepped names the label and stream keys removeRemote already handled this
+	// pass, so the due re-inspects of other streams skip them (hk 7019).
+	stepped map[string]bool
 	// hostlessProbes is the probes of host-less checkout paths each host took
 	// this pass.
 	hostlessProbes map[string]int
@@ -793,13 +828,81 @@ func (w *reviewerSweep) takeRemovedProbe(host string) bool {
 }
 
 // noteReprobe leaves the pending marker a removed stream's re-inspect needs when
-// the allowance held it or the inspect failed: the label stays a candidate for
-// the next pass (hk 6992). A marker already there is not written again.
+// the allowance held it: the label stays a candidate for the next pass (hk
+// 6992). The marker keeps the removed proof and the count, and a marker already
+// there is not written again. A held re-inspect is not an attempt.
 func (w *reviewerSweep) noteReprobe(rec reapReceipt, prior reapReceipt) {
 	if prior.Result == "pending-cleanup" && prior.Reason == reviewerRemovedReprobe {
 		return
 	}
+	rec.Recreated, rec.Reinspects = true, prior.Reinspects
 	w.record(rec, "pending-cleanup", reviewerRemovedReprobe)
+}
+
+// noteInspectFailed records a failed re-inspect of a removed path. The stream
+// keeps its pending marker for the next pass until the attempts are spent; the
+// last failure settles it with a terminal row naming the error (hk 7019).
+func (w *reviewerSweep) noteInspectFailed(rec reapReceipt, prior reapReceipt, e error) {
+	rec.Recreated, rec.Reinspects = true, prior.Reinspects+1
+	if rec.Reinspects >= reviewerRemovedAttempts {
+		w.record(rec, "skipped", fmt.Sprintf("%s%d times; last error: %s", reviewerRemovedUnreadable, rec.Reinspects, e))
+		return
+	}
+	w.record(rec, "pending-cleanup", reviewerRemovedReprobe)
+}
+
+// noteAbsent records a removed path's absent re-inspect: the answer that stands
+// for a day, or, once the path was re-inspected reviewerRemovedAttempts times
+// since its removal, the terminal row that is never due again (hk 7019).
+func (w *reviewerSweep) noteAbsent(rec reapReceipt, prior reapReceipt) {
+	rec.Recreated, rec.Reinspects = true, prior.Reinspects+1
+	if rec.Reinspects >= reviewerRemovedAttempts {
+		w.record(rec, "skipped", fmt.Sprintf("%s%d re-inspects", reviewerRemovedSettled, rec.Reinspects))
+		return
+	}
+	w.record(rec, "skipped", reviewerRemovedAbsentReason(w.now))
+}
+
+// removedDue reports whether one stream's removed path is due its re-inspect: an
+// absent answer or a recreated removal a day old, on a host this pass scanned.
+// Admission and the visit both use it, so the label is revisited for exactly the
+// streams that are due (hk 7017, hk 7019).
+func (w *reviewerSweep) removedDue(v reapReceipt) bool {
+	if w.now.Sub(v.Time) < reviewerRemovedAbsentAfter {
+		return false
+	}
+	if hs := w.scannedHost(v.Host); hs == nil || hs.failed {
+		return false
+	}
+	if v.Result == "skipped" && strings.HasPrefix(v.Reason, reviewerRemovedAbsent) {
+		return true
+	}
+	return v.Result == "removed" && strings.HasPrefix(v.Reason, reviewerRecreatedRemoved)
+}
+
+// removeDueRemoved re-inspects the label's other removed streams that are due.
+// The visit steps the stream its job names; a label is admitted for any due
+// stream, so the rest are stepped here (hk 7017).
+func (w *reviewerSweep) removeDueRemoved(ctx context.Context, l reviewerLabel) remoteStep {
+	keys := make([]string, 0, len(w.streams[l.name]))
+	for key := range w.streams[l.name] {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		v := w.streams[l.name][key]
+		if !w.removedDue(v) || w.stepped[l.name+"\x00"+key] {
+			continue
+		}
+		hs := w.scannedHost(v.Host)
+		if hs.host.Local() {
+			continue
+		}
+		if w.removeRemote(ctx, hs, l, v.Worktree) == remoteStop {
+			return remoteStop
+		}
+	}
+	return remoteDone
 }
 
 // noteProbeHeld records the first label the legacy probe allowance held this
@@ -1012,13 +1115,7 @@ func (w *reviewerSweep) candidates(lastCleanup map[string]reapReceipt, prNum int
 // have all ended, so it is visited again only for this.
 func (w *reviewerSweep) absentDue(label string) bool {
 	for _, v := range w.streams[label] {
-		if w.now.Sub(v.Time) < reviewerRemovedAbsentAfter {
-			continue
-		}
-		if v.Result == "skipped" && strings.HasPrefix(v.Reason, reviewerRemovedAbsent) {
-			return true
-		}
-		if v.Result == "removed" && strings.HasPrefix(v.Reason, reviewerRecreatedRemoved) {
+		if w.removedDue(v) {
 			return true
 		}
 	}
@@ -1327,12 +1424,18 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 			return
 		}
 	}
-	if hs != nil {
-		// L1: an unknown remote path is recorded as pending-cleanup and does not
-		// block the local checkout. L2: a refused or failed removal does.
-		if !hs.host.Local() && w.removeRemote(ctx, hs, l, cwd) == remoteStop {
-			return
-		}
+	// L1: an unknown remote path is recorded as pending-cleanup and does not
+	// block the local checkout. L2: a refused or failed removal does. The due
+	// removed streams of the label are stepped whatever the job's own stream did.
+	stop := false
+	if hs != nil && !hs.host.Local() && w.removeRemote(ctx, hs, l, cwd) == remoteStop {
+		stop = true
+	}
+	if w.removeDueRemoved(ctx, l) == remoteStop {
+		stop = true
+	}
+	if stop {
+		return
 	}
 	w.removeLocal(ctx, l)
 }
@@ -1966,6 +2069,9 @@ func (w *reviewerSweep) removeUnrecorded(ctx context.Context, l reviewerLabel, c
 			return
 		}
 	}
+	if w.removeDueRemoved(ctx, l) == remoteStop {
+		return
+	}
 	if c.host == "" || open {
 		if !w.discoverUnrecorded(ctx, l, only) {
 			return
@@ -2358,9 +2464,13 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 	}
 	// The stream's newest row says whether the hub was asked already: a final
 	// refusal is not asked again, and a pending one waits out its interval.
+	w.markStepped(l.name, reviewerStream(rec))
 	prior := w.streams[l.name][reviewerStream(rec)]
 	switch {
 	case reviewerTerminal(prior) && prior.Result == "kept":
+		return remoteDone
+	case reviewerRemovedDone(prior):
+		// The removed path's re-inspects are spent: no inspect, no row (hk 7019).
 		return remoteDone
 	case reviewerWaiting(prior, w.now):
 		return remoteStop
@@ -2375,8 +2485,11 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 	// the host's removed-path allowance (hk 6992), never the legacy one. A probe
 	// that is held or fails leaves a pending marker that keeps the label a
 	// candidate, and the marker keeps the removed proof for the next pass. The
-	// remote side is unknown, so the local checkout is still cleaned (L1).
-	recreated := prior.Result == "removed" || reviewerReprobe(prior)
+	// remote side is unknown, so the local checkout is still cleaned (L1). A
+	// stream holding a tree already found keeps the proof, so its removal is
+	// still a recreated one (hk 7019).
+	recreated := reviewerRecreatedProof(prior)
+	rec.Recreated = recreated
 	if recreated {
 		if !w.takeRemovedProbe(hs.host.Name) {
 			// The hold is the sweep's first waiting removed label: the next
@@ -2387,13 +2500,13 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		}
 		tree, e := hs.ops.Inspect(ctx, cwd)
 		if e != nil {
-			w.noteReprobe(rec, prior)
+			w.noteInspectFailed(rec, prior, e)
 			return remotePathUnknown
 		}
-		// An absent tree settles the stream (hk 6992); the next re-inspect waits
-		// reviewerRemovedAbsentAfter.
+		// An absent tree is an answer of the re-inspect, counted toward its
+		// attempts (hk 6992, hk 7019).
 		if tree == nil {
-			w.record(rec, "skipped", reviewerRemovedAbsentReason(w.now))
+			w.noteAbsent(rec, prior)
 			return remoteDone
 		}
 	}
@@ -2443,8 +2556,13 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 			}
 			cwd = legacy
 			rec.Cwd, rec.Worktree = cwd, cwd
+			w.markStepped(l.name, reviewerStream(rec))
 			prior = w.streams[l.name][reviewerStream(rec)]
-			if reviewerTerminal(prior) && prior.Result == "kept" {
+			// The proof belongs to the stream now probed: the legacy path's
+			// own rows decide whether it was a removed path (hk 7019).
+			recreated = reviewerRecreatedProof(prior)
+			rec.Recreated = recreated
+			if (reviewerTerminal(prior) && prior.Result == "kept") || reviewerRemovedDone(prior) {
 				return remoteDone
 			}
 			if reviewerWaiting(prior, w.now) {
@@ -2466,9 +2584,10 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 	switch {
 	case e != nil && recreated:
 		// The first probe showed a tree, so an error here is not an absent
-		// tree: the stream keeps a pending marker for the next pass (hk 6992).
-		// The host is not failed by it (hk 6983).
-		w.noteReprobe(rec, prior)
+		// tree: the stream keeps a pending marker for the next pass, until its
+		// attempts are spent (hk 6992, hk 7019). The host is not failed by it
+		// (hk 6983).
+		w.noteInspectFailed(rec, prior, e)
 		return remotePathUnknown
 	case reviewerBudgetCut(ctx, e):
 		w.record(rec, "pending-cleanup", reviewerBudgetHold)
@@ -2484,7 +2603,7 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		w.record(rec, "error", "worktree inspect: "+e.Error())
 		return remoteStop
 	case tree == nil && recreated:
-		w.record(rec, "skipped", reviewerRemovedAbsentReason(w.now))
+		w.noteAbsent(rec, prior)
 		return remoteDone
 	case tree == nil:
 		w.record(rec, "skipped", reviewerAlreadyGone)
@@ -2518,7 +2637,8 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		// "removed" would be dropped as a repeat. This row names the recreated
 		// checkout, so the second removal is recorded and counted (hk 6983).
 		// The instant keeps a third removal at this path from repeating the
-		// second row's reason.
+		// second row's reason. The count restarts from this removal (hk 7019).
+		rec.Reinspects = 0
 		w.record(rec, "removed", fmt.Sprintf("%s (%s)", reviewerRecreatedRemoved, w.now.UTC().Format(time.RFC3339)))
 		return remoteDone
 	case result == "removed":
