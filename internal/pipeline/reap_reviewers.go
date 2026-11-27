@@ -158,8 +158,18 @@ const (
 	reviewerRefused = "hub guarded removal refused: "
 	// reviewerHostUnknown is the terminal reason of an aged label whose job
 	// record is gone and whose receipts and audit rows name no host: nothing
-	// can build a remote path for it.
-	reviewerHostUnknown = "no record names a host for this reviewer label"
+	// can build a remote path for it. A terminal row may add the hosts it
+	// never probed after reviewerHostUnprobed.
+	reviewerHostUnknown  = "no record names a host for this reviewer label"
+	reviewerHostUnprobed = "; never probed: "
+	// reviewerHostsPendingPrefix and reviewerHostsPendingSuffix frame the
+	// pending reason of a host-less label that names the hosts still owed a
+	// probe; the next pass probes those hosts only.
+	reviewerHostsPendingPrefix = "host checkout probe unavailable at "
+	reviewerHostsPendingSuffix = "; the next pass probes only those hosts"
+	// reviewerHostlessMaxAge is how old a host-less label may get while the
+	// only hosts left unanswered are failed or have no work root.
+	reviewerHostlessMaxAge = 7 * 24 * time.Hour
 	// reviewerAlreadyClosed is the reason of a closed row: panewire refused the
 	// job close because the job already has a terminal record, so the job has
 	// ended and nothing is owed for it.
@@ -186,6 +196,10 @@ const (
 	// reviewerLegacyProbesPerHost bounds the remote fallback probes independently
 	// of guarded removals. The old-path backlog must not monopolize a pass.
 	reviewerLegacyProbesPerHost = 5
+	// reviewerHostlessProbesPerHost bounds the probes of a host-less label's
+	// checkout path per host and pass. It is its own allowance, so a backlog of
+	// host-less labels never takes the legacy-path probes' share.
+	reviewerHostlessProbesPerHost = 5
 	// reviewerBudgetHold is the pending reason of a reviewer step the repo
 	// budget cut: the checkout is kept for a later sweep, and the cut is not an
 	// error row.
@@ -208,7 +222,7 @@ func reviewerTerminal(v reapReceipt) bool {
 	case "skipped":
 		return strings.Contains(v.Reason, "already gone") || strings.HasPrefix(v.Reason, reviewerOtherRepo) || v.Reason == reviewerHostDiscovered
 	case "kept":
-		return v.Worktree != "" && (v.Reason == reviewerHostUnknown || strings.HasPrefix(v.Reason, reviewerRefused))
+		return v.Worktree != "" && (strings.HasPrefix(v.Reason, reviewerHostUnknown) || strings.HasPrefix(v.Reason, reviewerRefused))
 	}
 	return false
 }
@@ -308,7 +322,10 @@ type reviewerSweep struct {
 	// the names in host_order.
 	drain        map[string]int
 	legacyProbes map[string]int
-	hostRank     map[string]int
+	// hostlessProbes is the probes of host-less checkout paths each host took
+	// this pass.
+	hostlessProbes map[string]int
+	hostRank       map[string]int
 	// paneHost maps a PR and pane id to the host a receipt recorded for it,
 	// the fallback when a leaked label's audit row names no host. A key two
 	// hosts claim is not used: the pane id alone would be a guess.
@@ -655,7 +672,7 @@ func (w *reviewerSweep) hostUnknownTerminal(label string) bool {
 		if !reviewerTerminal(v) {
 			return false
 		}
-		if v.Result == "kept" && v.Reason == reviewerHostUnknown {
+		if v.Result == "kept" && strings.HasPrefix(v.Reason, reviewerHostUnknown) {
 			found = true
 		}
 	}
@@ -1700,53 +1717,129 @@ func (w *reviewerSweep) remembered(l reviewerLabel, hs *reapHost) string {
 
 // removeUnrecorded releases the worktrees of a label whose job record is gone
 // and which no pane uses. The host comes from the receipts, the audit row or
-// the pane; when none names one, no remote path can be built and the label
-// ends with a terminal row.
+// the pane; when none names one, the configured work roots are searched. A
+// host-less discovery that an earlier pass left open is resumed even when a
+// later receipt named a host for the label.
 func (w *reviewerSweep) removeUnrecorded(ctx context.Context, l reviewerLabel, c reviewerCandidate) {
-	if hs := w.scannedHost(c.host); hs != nil {
-		if hs.failed {
-			// The host's scan already reported its error; nothing about it
-			// can be inspected or proven, so the label waits for a pass that
-			// reads the host.
-			return
-		}
-		if !hs.host.Local() && w.removeRemote(ctx, hs, l, w.remembered(l, hs)) == remoteStop {
-			return
-		}
-	} else if c.host != "" {
+	hs := w.scannedHost(c.host)
+	if c.host != "" && hs == nil {
 		// A record names a host this pass could not scan, because it is not
 		// configured right now: keep the label pending so a restored host
 		// still gets its worktree.
 		rec := w.row(l)
 		rec.Host, rec.Worktree = c.host, l.name
 		w.record(rec, "kept", "job-host-unconfigured")
-	} else {
-		// No record, receipt or audit row names a host, so no remote path can
-		// be built. Search the configured work roots before settling it.
-		if hs, uncertain, capped := w.findUnrecordedCheckout(ctx, l); hs != nil {
-			w.settleHostlessStream(l)
-			if w.removeRemote(ctx, hs, l, "") == remoteStop {
-				return
-			}
-		} else if uncertain {
-			rec := w.row(l)
-			rec.Worktree = l.name
-			if capped != "" {
-				w.record(rec, "pending-cleanup", fmt.Sprintf(reviewerHostProbeHold, capped))
-			} else {
-				w.record(rec, "pending-cleanup", "host checkout probe unavailable")
-			}
-		} else {
-			rec := w.row(l)
-			rec.Host, rec.Worktree = c.host, l.name
-			if w.acting {
-				w.record(rec, "kept", reviewerHostUnknown)
-			} else {
-				w.record(rec, "pending-cleanup", "remote host unavailable")
-			}
+		w.removeLocal(ctx, l)
+		return
+	}
+	only, open := w.hostlessPending(l)
+	if hs != nil {
+		switch {
+		case hs.failed && !open:
+			// The host's scan already reported its error; nothing about it
+			// can be inspected or proven, so the label waits for a pass that
+			// reads the host.
+			return
+		case hs.failed:
+			// Open discovery still owes probes to other hosts, which a failed
+			// host does not block: its own removal waits for a pass that reads it.
+		case !hs.host.Local() && w.removeRemote(ctx, hs, l, w.remembered(l, hs)) == remoteStop:
+			return
+		}
+	}
+	if c.host == "" || open {
+		if !w.discoverUnrecorded(ctx, l, only) {
+			return
 		}
 	}
 	w.removeLocal(ctx, l)
+}
+
+// discoverUnrecorded searches the configured work roots for the checkout of a
+// label no record names a host for. only, when set, limits the probes to the
+// hosts a pass left uncertain. It reports false when the visit ends here.
+func (w *reviewerSweep) discoverUnrecorded(ctx context.Context, l reviewerLabel, only map[string]bool) bool {
+	found, uncertain, blocked, capped := w.findUnrecordedCheckout(ctx, l, only)
+	switch {
+	case found != nil && !blocked:
+		// Exactly one reachable host holds the checkout, and the only doubt is
+		// hosts that failed or have no work root: the checkout is removed there.
+		// The label stays pending for those hosts alone.
+		// The owed hosts are written before the removal, so they survive a
+		// removal that stops; the placeholder settles only when none are owed.
+		if len(uncertain) > 0 {
+			w.recordHostless(l, "pending-cleanup", hostsPendingReason(uncertain))
+		} else {
+			w.settleHostlessStream(l)
+		}
+		if w.removeRemote(ctx, found, l, "") == remoteStop {
+			return false
+		}
+	case blocked:
+		// A probe cap or an inspect error that is not a down host leaves the
+		// label pending for every host; the next pass probes them all again.
+		reason := "host checkout probe unavailable"
+		if capped != "" {
+			reason = fmt.Sprintf(reviewerHostProbeHold, capped)
+		}
+		w.recordHostless(l, "pending-cleanup", reason)
+	case len(uncertain) > 0:
+		// Only failed hosts or hosts without a work root remain unanswered.
+		// Once the spawn is past reviewerHostlessMaxAge, the label settles with
+		// the hosts that were never probed named in its reason.
+		if l.started.Add(reviewerHostlessMaxAge).Before(w.now) {
+			w.recordHostless(l, "kept", reviewerHostUnknown+reviewerHostUnprobed+strings.Join(uncertain, ", "))
+		} else {
+			w.recordHostless(l, "pending-cleanup", hostsPendingReason(uncertain))
+		}
+	default:
+		// Nothing holds the checkout and no host is left to ask: the label
+		// ends with its terminal row. A dry run leaves it pending.
+		if w.acting {
+			w.recordHostless(l, "kept", reviewerHostUnknown)
+		} else {
+			w.recordHostless(l, "pending-cleanup", "remote host unavailable")
+		}
+	}
+	return true
+}
+
+// recordHostless writes a row on the label's host-less stream, the one a
+// discovery that named no host keeps.
+func (w *reviewerSweep) recordHostless(l reviewerLabel, result, reason string) {
+	rec := w.row(l)
+	rec.Worktree = l.name
+	w.record(rec, result, reason)
+}
+
+// hostsPendingReason is the pending reason of a host-less label whose
+// remaining probes are owed to the named hosts.
+func hostsPendingReason(hosts []string) string {
+	return reviewerHostsPendingPrefix + strings.Join(hosts, ", ") + reviewerHostsPendingSuffix
+}
+
+// hostlessPending reports whether a label's host-less discovery is still open
+// and, when its pending row names the hosts still owed a probe, those hosts.
+// A nil set with open true means every host is probed again.
+func (w *reviewerSweep) hostlessPending(l reviewerLabel) (map[string]bool, bool) {
+	v, ok := w.streams[l.name][reviewerStream(reapReceipt{Worktree: l.name})]
+	if !ok || reviewerTerminal(v) {
+		return nil, false
+	}
+	var only map[string]bool
+	if rest, ok := strings.CutPrefix(v.Reason, reviewerHostsPendingPrefix); ok {
+		if names, ok := strings.CutSuffix(rest, reviewerHostsPendingSuffix); ok {
+			for _, n := range strings.Split(names, ", ") {
+				if hs := w.scannedHost(n); hs != nil && !hs.host.Local() {
+					if only == nil {
+						only = map[string]bool{}
+					}
+					only[hs.host.Name] = true
+				}
+			}
+		}
+	}
+	return only, true
 }
 
 // settleHostlessStream closes a prior discovery placeholder once a unique
@@ -1762,31 +1855,30 @@ func (w *reviewerSweep) settleHostlessStream(l reviewerLabel) {
 	w.record(rec, "skipped", reviewerHostDiscovered)
 }
 
-// findUnrecordedCheckout probes the spec checkout path on hosts without a
-// work root or failed scan left the result uncertain. The shared probe budget
-// never spends a guarded-removal slot; dry runs do no remote inspection.
-func (w *reviewerSweep) findUnrecordedCheckout(ctx context.Context, l reviewerLabel) (*reapHost, bool, string) {
+// findUnrecordedCheckout probes the spec checkout path <work root>/<label>-checkout
+// on the remote hosts, or only on the hosts in only when it is set. It returns the one host that holds
+// the checkout, the hosts it could not answer for (failed, without a work root,
+// or past the probe allowance), and whether an uncertainty a removal cannot be
+// proven past remains: a probe cap, an inspect error, or a second copy. Two
+// copies name no host at all. The host-less probes have their own allowance,
+// so they never take the legacy-path probes' share. Dry runs probe nothing.
+func (w *reviewerSweep) findUnrecordedCheckout(ctx context.Context, l reviewerLabel, only map[string]bool) (found *reapHost, uncertain []string, blocked bool, capped string) {
 	if !w.acting {
-		return nil, false, ""
+		return nil, nil, false, ""
 	}
-	var found *reapHost
-	uncertain := false
-	capped := ""
+	matches := 0
 	for _, hs := range w.hosts {
-		if hs.host.Local() {
+		if hs.host.Local() || (only != nil && !only[hs.host.Name]) {
 			continue
 		}
 		path := reviewerWorktreePath(hs, l)
-		if path == "" {
-			uncertain = true
+		if path == "" || hs.failed {
+			uncertain = append(uncertain, hs.host.Name)
 			continue
 		}
-		if hs.failed {
-			uncertain = true
-			continue
-		}
-		if !w.takeLegacyProbe(hs.host.Name) {
-			uncertain = true
+		if !w.takeHostlessProbe(hs.host.Name) {
+			uncertain = append(uncertain, hs.host.Name)
+			blocked = true
 			if capped == "" {
 				capped = hs.host.Name
 			}
@@ -1794,23 +1886,37 @@ func (w *reviewerSweep) findUnrecordedCheckout(ctx context.Context, l reviewerLa
 		}
 		tree, err := hs.ops.Inspect(ctx, path)
 		if err != nil {
+			uncertain = append(uncertain, hs.host.Name)
 			if isHostUnreachable(err) {
 				hs.failed = true
+			} else {
+				blocked = true
 			}
-			uncertain = true
 			continue
 		}
 		if tree != nil {
-			if found != nil {
-				return nil, false, ""
-			}
+			matches++
 			found = hs
 		}
 	}
-	if found != nil && !uncertain {
-		return found, false, ""
+	if matches > 1 {
+		return nil, nil, false, ""
 	}
-	return nil, uncertain, capped
+	return found, uncertain, blocked, capped
+}
+
+// takeHostlessProbe spends one host's probe of the spec checkout path for
+// labels no record names a host for. Its allowance is separate from the
+// legacy-path probes.
+func (w *reviewerSweep) takeHostlessProbe(host string) bool {
+	if w.hostlessProbes == nil {
+		w.hostlessProbes = map[string]int{}
+	}
+	if w.hostlessProbes[host] >= reviewerHostlessProbesPerHost {
+		return false
+	}
+	w.hostlessProbes[host]++
+	return true
 }
 
 // remoteStep is how the remote worktree step ended, as the local step needs it.
