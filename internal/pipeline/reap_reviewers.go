@@ -338,6 +338,14 @@ func (w *reviewerSweep) markStepped(label, key string) {
 	w.stepped[label+"\x00"+key] = true
 }
 
+// pathStepped reports whether removeRemote already handled the checkout at path
+// on rec's host this pass (hk 7028).
+func (w *reviewerSweep) pathStepped(l reviewerLabel, rec reapReceipt, path string) bool {
+	probe := rec
+	probe.Worktree = path
+	return w.stepped[l.name+"\x00"+reviewerStream(probe)]
+}
+
 // reviewerRemovedAbsentReason is the reason of an absent answer at instant now.
 // Each answer carries its instant, so a later absent answer is a new row: an
 // identical reason would be dropped as a repeat and the stream would never
@@ -898,16 +906,18 @@ func (w *reviewerSweep) noteInspectFailed(ctx context.Context, rec reapReceipt, 
 		w.noteRemovedHold(rec, prior, reviewerRemovedReprobe)
 		return remotePathUnknown
 	}
-	if _, refused := refusalRetries(prior); refused {
-		w.noteRemovedHold(rec, prior, reviewerRemovedReprobe)
-		return remotePathUnknown
-	}
 	rec.Recreated, rec.Reinspects = true, prior.Reinspects+1
 	if rec.Reinspects >= reviewerRemovedAttempts {
 		w.record(rec, "skipped", fmt.Sprintf("%s%d times; last error: %s", reviewerRemovedUnreadable, rec.Reinspects, e))
 		return remotePathUnknown
 	}
-	w.record(rec, "pending-cleanup", reviewerRemovedReprobe)
+	// A pending refusal keeps its reason and retry count; the count above is
+	// what changes, so the rewritten row is not an identical repeat (hk 7028).
+	reason := reviewerRemovedReprobe
+	if _, refused := refusalRetries(prior); refused {
+		reason = prior.Reason
+	}
+	w.record(rec, "pending-cleanup", reason)
 	return remotePathUnknown
 }
 
@@ -2641,7 +2651,9 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 	// pre-suffix work-root layout once. Preserve that path in the receipt so
 	// the source of this cleanup is visible and terminal rows stop repeating.
 	if e == nil && tree == nil && filepath.Base(filepath.Clean(cwd)) == l.name+reviewerCheckoutSuffix {
-		if legacy := reviewerLegacyWorktreePath(hs, l); legacy != "" {
+		// A legacy path this pass already stepped is not inspected or removed
+		// again: the spec path stays absent (hk 7028).
+		if legacy := reviewerLegacyWorktreePath(hs, l); legacy != "" && !w.pathStepped(l, rec, legacy) {
 			if w.legacyFallback(l.name, hs.host.Name) && !w.takeLegacyProbe(hs.host.Name) {
 				// Keep the hold separate from the reviewer-reap stream so the
 				// original already-gone row continues to make this label a candidate.
