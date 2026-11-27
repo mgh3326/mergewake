@@ -122,10 +122,12 @@ func (s *Service) localDiff(ctx context.Context, r config.Repo, pr github.Pull) 
 
 // baseChangesDropped checks each first-parent merge's own result. A base commit
 // counts when a merge lost a line it added: the merge's second parent has the
-// line and the merge tree does not. A lost line the PR head still carries, or
-// that the PR's net diff (merge-base..head) adds back or edits, is reviewed
-// there and does not count (hk 7021). The verdict is cached for an unchanged
-// base/head pair.
+// line and the merge tree does not. A lost base line is a drop unless the PR
+// head carries it verbatim, count-aware per path, looked up under the path the
+// file has at head (following the merge's rename and any rename up to head).
+// An edit kept from a merge resolution is a drop; intentional edits belong in a
+// regular commit after the merge (hk 7021, hk 7032). The verdict is cached for
+// an unchanged base/head pair.
 func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr github.Pull) ([]string, error) {
 	root := config.Expand(r.Root)
 	if root == "" || s.Runner == nil || pr.Head.SHA == "" || pr.Base.SHA == "" {
@@ -219,6 +221,9 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 		if err != nil || forkPoint == "" {
 			return nil, fmt.Errorf("find fork point for merge %s", merge)
 		}
+		// headRenames maps each path this merge renamed to its path at head. It
+		// is read once per merge, and only when the merge lost a line.
+		var headRenames map[string]string
 		introducedText, err := field("rev-list", parents[2], "^"+forkPoint)
 		if err != nil {
 			return nil, fmt.Errorf("list commits introduced by merge %s: %w", merge, err)
@@ -272,7 +277,18 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 					return nil, fmt.Errorf("read merge line origins for %s: %w", mergePath, err)
 				}
 				if countOrigin(mergeLines, commit) < atSecondParent {
-					key := dropCandidate{commit: commit, base: parents[2], path: path}
+					if headRenames == nil {
+						renamesToHead, err := git("diff-tree", "--find-renames", "--no-commit-id", "--name-status", "-z", "-r", merge, pr.Head.SHA)
+						if err != nil {
+							return nil, fmt.Errorf("read renames from merge %s to head: %w", merge, err)
+						}
+						headRenames = renamedPaths(renamesToHead)
+					}
+					headPath := mergePath
+					if renamed, ok := headRenames[mergePath]; ok {
+						headPath = renamed
+					}
+					key := dropCandidate{commit: commit, base: parents[2], path: path, headPath: headPath}
 					if !candidateSeen[key] {
 						candidateSeen[key] = true
 						dropCandidates = append(dropCandidates, key)
@@ -291,9 +307,9 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 		if err != nil {
 			return nil, fmt.Errorf("read base-side line origins for %s: %w", c.path, err)
 		}
-		headLines, err := fileBlame(git, pr.Head.SHA, c.path, blames)
+		headLines, err := fileBlame(git, pr.Head.SHA, c.headPath, blames)
 		if err != nil {
-			return nil, fmt.Errorf("read head line texts for %s: %w", c.path, err)
+			return nil, fmt.Errorf("read head line texts for %s: %w", c.headPath, err)
 		}
 		baseAll, headAll := map[string]int{}, map[string]int{}
 		for _, line := range baseLines {
@@ -400,11 +416,14 @@ func renamedPaths(status string) map[string]string {
 }
 
 // dropCandidate is a base commit's lines that a merge lost: the base side
-// (a merge's second parent) carries them at path and the merge does not.
+// (a merge's second parent) carries them at path and the merge does not. The
+// head's copy of them lives at headPath, which equals path unless a rename
+// moved the file.
 type dropCandidate struct {
-	commit string
-	base   string
-	path   string
+	commit   string
+	base     string
+	path     string
+	headPath string
 }
 
 // blameLine is one line of a file at a revision and the commit that last set it.
