@@ -259,3 +259,115 @@ func TestReviewRefusesDiffWhoseHeadersAloneExceedBudget(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+// elidedPR is an oversized PR: a large file whose hunk is elided under the test
+// budget, and a small file that always stays. index, start and ctx vary with
+// the base the head was built on; added is the file's one changed line.
+func elidedPR(index string, start int, ctx, added string) string {
+	big := "diff --git a/big.txt b/big.txt\nindex " + index + " 100644\n--- a/big.txt\n+++ b/big.txt\n" +
+		"@@ -" + itoa(start) + ",51 +" + itoa(start) + ",51 @@\n" +
+		strings.Repeat(" "+ctx+" "+strings.Repeat("c", 20)+"\n", 50) + "-old\n+" + added + "\n"
+	small := "diff --git a/small.txt b/small.txt\nindex 3333333..4444444 100644\n--- a/small.txt\n+++ b/small.txt\n" +
+		"@@ -1,3 +1,3 @@\n keep\n-old\n+new\n end\n"
+	return big + small
+}
+
+// A base merge that only shifts an elided file's context and line numbers must
+// keep the review's patch id: the elided digest covers the changed lines only.
+func TestElidedPatchIDIgnoresBaseMergeShift(t *testing.T) {
+	const budget = 400
+	before := elidedPR("1111111..2222222", 1, "keep", "new")
+	after := elidedPR("aaaaaaa..bbbbbbb", 41, "kept", "new")
+	a, sa := summarizeLocalDiff(before, budget)
+	b, sb := summarizeLocalDiff(after, budget)
+	if !slices.Contains(sa, "big.txt") || !slices.Contains(sb, "big.txt") {
+		t.Fatalf("big.txt was not elided: %v %v", sa, sb)
+	}
+	ida, idb := reviewPatchID(a), reviewPatchID(b)
+	if ida == "" || ida != idb {
+		t.Fatalf("a base merge that only shifted an elided file changed the patch id: %q != %q", ida, idb)
+	}
+}
+
+// One changed line in an elided file is a different patch, so the digest must
+// still move with the + and - lines.
+func TestElidedPatchIDTracksChangedLine(t *testing.T) {
+	const budget = 400
+	a, _ := summarizeLocalDiff(elidedPR("1111111..2222222", 1, "keep", "new"), budget)
+	b, _ := summarizeLocalDiff(elidedPR("1111111..2222222", 1, "keep", "newer"), budget)
+	if reviewPatchID(a) == reviewPatchID(b) {
+		t.Fatal("a changed + line in an elided file kept the patch id")
+	}
+}
+
+// hunkFile is one modified file whose hunk holds lines (each starting with
+// ' ', '+', '-' or '\'); the hunk counts are derived from them.
+func hunkFile(name, index string, lines ...string) string {
+	oldN, newN := 0, 0
+	for _, l := range lines {
+		switch l[0] {
+		case ' ':
+			oldN++
+			newN++
+		case '-':
+			oldN++
+		case '+':
+			newN++
+		}
+	}
+	var b strings.Builder
+	b.WriteString("diff --git a/" + name + " b/" + name + "\nindex " + index + " 100644\n--- a/" + name + "\n+++ b/" + name + "\n")
+	b.WriteString("@@ -1," + itoa(oldN) + " +1," + itoa(newN) + " @@\n")
+	for _, l := range lines {
+		b.WriteString(l + "\n")
+	}
+	return b.String()
+}
+
+// longCtx is a context line long enough that a file holding a few of them is
+// elided under the test budget.
+var longCtx = " " + strings.Repeat("c", 200)
+
+// elidedWith puts one elided big file in front of a small file that stays.
+func elidedWith(big string) string {
+	small := "diff --git a/small.txt b/small.txt\nindex 3333333..4444444 100644\n--- a/small.txt\n+++ b/small.txt\n" +
+		"@@ -1,3 +1,3 @@\n keep\n-old\n+new\n end\n"
+	return big + small
+}
+
+// Moving an added line within an elided file's hunk moves the patch, so the
+// patch id must change even though the changed text is identical.
+func TestElidedPatchIDTracksChangePosition(t *testing.T) {
+	const budget = 400
+	before := elidedWith(hunkFile("big.txt", "1111111..2222222",
+		longCtx, longCtx, longCtx, "+authorize()", longCtx, longCtx, longCtx))
+	after := elidedWith(hunkFile("big.txt", "1111111..2222222",
+		longCtx, longCtx, longCtx, longCtx, "+authorize()", longCtx, longCtx))
+	a, sa := summarizeLocalDiff(before, budget)
+	b, sb := summarizeLocalDiff(after, budget)
+	if !slices.Contains(sa, "big.txt") || !slices.Contains(sb, "big.txt") {
+		t.Fatalf("big.txt was not elided: %v %v", sa, sb)
+	}
+	if reviewPatchID(a) == reviewPatchID(b) {
+		t.Fatal("an added line moved within an elided file kept the patch id")
+	}
+}
+
+// The end-of-file newline marker is part of the changed text: a head that adds
+// or drops the final newline is a different patch.
+func TestElidedPatchIDTracksNoNewlineMarker(t *testing.T) {
+	const budget = 400
+	const marker = "\\ No newline at end of file"
+	before := elidedWith(hunkFile("big.txt", "1111111..2222222",
+		longCtx, longCtx, longCtx, "-foo", marker, "+foo"))
+	after := elidedWith(hunkFile("big.txt", "1111111..2222222",
+		longCtx, longCtx, longCtx, "-foo", "+foo", marker))
+	a, sa := summarizeLocalDiff(before, budget)
+	b, sb := summarizeLocalDiff(after, budget)
+	if !slices.Contains(sa, "big.txt") || !slices.Contains(sb, "big.txt") {
+		t.Fatalf("big.txt was not elided: %v %v", sa, sb)
+	}
+	if reviewPatchID(a) == reviewPatchID(b) {
+		t.Fatal("a moved end-of-file newline marker kept the patch id")
+	}
+}
