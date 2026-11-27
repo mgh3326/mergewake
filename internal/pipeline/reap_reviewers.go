@@ -877,7 +877,7 @@ func (w *reviewerSweep) candidates(lastCleanup map[string]reapReceipt, prNum int
 		labels[label] = true
 	}
 	for label := range labels {
-		if paned[label] || (w.finishedLabel(label, lastCleanup) && !w.oldPathRetry(label, w.labelHost[label]) && !w.bareUnknown(label)) {
+		if paned[label] || (w.finishedLabel(label, lastCleanup) && !w.oldPathRetry(label, w.labelHost[label]) && !w.bareUnknown(label) && !w.absentDue(label)) {
 			continue
 		}
 		if l, ok := keep(label); ok {
@@ -932,6 +932,19 @@ func (w *reviewerSweep) candidates(lastCleanup map[string]reapReceipt, prNum int
 		return cands[i].label.name < cands[j].label.name
 	})
 	return cands
+}
+
+// absentDue reports whether a label's removed path answered absent a day or
+// more ago. Its streams have all ended, so it is visited again only for this:
+// the 24h re-inspect a same-label revival is found by once its pane has closed
+// (hk 6992).
+func (w *reviewerSweep) absentDue(label string) bool {
+	for _, v := range w.streams[label] {
+		if v.Result == "skipped" && strings.HasPrefix(v.Reason, reviewerRemovedAbsent) && w.now.Sub(v.Time) >= reviewerRemovedAbsentAfter {
+			return true
+		}
+	}
+	return false
 }
 
 // oldPathRetry reopens a label whose last attempt found the spec-format path
@@ -2251,9 +2264,10 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		return remoteDone
 	case reviewerWaiting(prior, w.now):
 		return remoteStop
-	case reviewerAbsentSettled(prior, w.now) && !hs.paneInUse(cwd):
-		// A pane still using the path is a revival: it is inspected below, so
-		// the pane-in-use row keeps the label retried (hk 6992).
+	case reviewerAbsentSettled(prior, w.now):
+		// Inside the day the absent answer stands: no probe and no row. A label
+		// whose streams all ended is visited again once the answer is due, so
+		// a revival that came back in the meantime is still found (hk 6992).
 		return remoteDone
 	}
 	// A removed stream's worktree may be recreated at the same path by a

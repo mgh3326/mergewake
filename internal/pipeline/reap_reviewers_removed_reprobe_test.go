@@ -172,9 +172,9 @@ func TestReapReviewerRemovedReprobesLeaveLegacyProbesTheirAllowance(t *testing.T
 	t.Fatalf("legacy label was starved by removed re-inspects: removes %v, rows %v", f.hub.ops("worktree.remove"), rowSummary(f.rows(t)))
 }
 
-// A settled absent answer does not hide a revival: a tree back at the path
-// within the day, with a pane using it, is inspected and kept pane-in-use, not
-// dropped silently (hk 6992). Fails without the pane guard on the gate.
+// A revival within the day after an absent answer is found once the answer is
+// due: the probe inspects the tree, and a pane using it keeps it pane-in-use
+// (hk 6992). Inside the day nothing is written or inspected.
 func TestReapReviewerAbsentSettleKeepsRevivalWithPane(t *testing.T) {
 	f := newReviewerFix(t)
 	f.s.Config.Hosts[0].WorkRoot = "/work"
@@ -190,7 +190,16 @@ func TestReapReviewerAbsentSettleKeepsRevivalWithPane(t *testing.T) {
 
 	f.hub.detached[path] = true
 	f.addPane("fixture-pane-b", "other", path)
+	before := len(f.rows(t))
 	f.s.Now = func() time.Time { return reviewerNow.Add(time.Hour) }
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if removes := f.hub.ops("worktree.remove"); len(removes) != 0 || len(f.rows(t)) != before {
+		t.Fatalf("inside the day: removes %v, rows %v", removes, rowSummary(f.rows(t)))
+	}
+
+	f.s.Now = func() time.Time { return reviewerNow.Add(25 * time.Hour) }
 	if err := f.reap(t, 0, Options{}); err != nil {
 		t.Fatal(err)
 	}
@@ -200,6 +209,79 @@ func TestReapReviewerAbsentSettleKeepsRevivalWithPane(t *testing.T) {
 	rows := f.rows(t)
 	if last := rows[len(rows)-1]; last.Result != "kept" || last.Reason != "pane-in-use" || last.Worktree != path {
 		t.Fatalf("revival was not kept: %v", rowSummary(rows))
+	}
+}
+
+// A pane on an absent removed path writes one absent answer and inspects the
+// path once a day, not on every pass (hk 6992).
+func TestReapReviewerAbsentPathUnderPaneSettlesOncePerDay(t *testing.T) {
+	f := newReviewerFix(t)
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	host := f.s.Config.Hosts[0].Name
+	pr := 12
+	label := reviewerLabelFor(pr, time.Hour)
+	path := "/work/" + label + reviewerCheckoutSuffix
+	f.sink.recs[label] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: label, Host: host}
+	seedReapRows(t, f.s, testRepo.Name, removedStreamRows(pr, label, path, host)...)
+	f.addPane("fixture-pane-b", "other", path)
+	inspects := func() int {
+		n := 0
+		for _, op := range f.hub.ops("worktree.inspect") {
+			if op["cwd"] == path {
+				n++
+			}
+		}
+		return n
+	}
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	after := inspects()
+	f.s.Now = func() time.Time { return reviewerNow.Add(time.Hour) }
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	// The host scan inspects every pane's cwd on each pass, so the pane on this
+	// path costs one inspect; the removed-path probe itself must not run.
+	if got := inspects() - after; got > 1 {
+		t.Fatalf("absent path under a pane was probed again inside the day: %d inspects", got)
+	}
+	absent := 0
+	for _, r := range f.rows(t) {
+		if r.Result == "skipped" && strings.HasPrefix(r.Reason, reviewerRemovedAbsent) {
+			absent++
+		}
+	}
+	if absent != 1 {
+		t.Fatalf("absent rows: %d, want 1: %v", absent, rowSummary(f.rows(t)))
+	}
+}
+
+// A revival whose pane closed inside the day is found at the due re-inspect:
+// the label's streams all end, so only the due absent answer brings it back
+// (hk 6992). Fails without the due re-admission in candidates.
+func TestReapReviewerAbsentSettleReadmitsClosedLabelAfterADay(t *testing.T) {
+	f := newReviewerFix(t)
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	host := f.s.Config.Hosts[0].Name
+	pr := 12
+	label := reviewerLabelFor(pr, time.Hour)
+	path := "/work/" + label + reviewerCheckoutSuffix
+	f.sink.recs[label] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: label, Host: host}
+	seedReapRows(t, f.s, testRepo.Name, removedStreamRows(pr, label, path, host)...)
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	closeSeededPane(t, f, pr, label, host)
+
+	f.hub.detached[path] = true
+	f.s.Now = func() time.Time { return reviewerNow.Add(25 * time.Hour) }
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	removes := f.hub.ops("worktree.remove")
+	if len(removes) != 1 || removes[0]["cwd"] != path {
+		t.Fatalf("revival after a closed pane was not removed: %v (rows %v)", removes, rowSummary(f.rows(t)))
 	}
 }
 
