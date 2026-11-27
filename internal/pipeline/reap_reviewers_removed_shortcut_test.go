@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -74,7 +75,7 @@ func TestReapReviewerRemovedRowDoesNotHideRecreatedCheckout(t *testing.T) {
 		if len(rows) != before+1 {
 			t.Fatalf("rows: want %d, got %v", before+1, rowSummary(rows))
 		}
-		if last := rows[len(rows)-1]; last.Result != "skipped" || last.Reason != reviewerRemovedAbsent || last.Worktree != path {
+		if last := rows[len(rows)-1]; last.Result != "skipped" || !strings.HasPrefix(last.Reason, reviewerRemovedAbsent) || last.Worktree != path {
 			t.Fatalf("settle row: %v", rowSummary(rows))
 		}
 		// Within a day the settled path is not inspected again: no row, no probe.

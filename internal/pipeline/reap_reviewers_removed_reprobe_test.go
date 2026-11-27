@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -169,4 +170,137 @@ func TestReapReviewerRemovedReprobesLeaveLegacyProbesTheirAllowance(t *testing.T
 		}
 	}
 	t.Fatalf("legacy label was starved by removed re-inspects: removes %v, rows %v", f.hub.ops("worktree.remove"), rowSummary(f.rows(t)))
+}
+
+// A settled absent answer does not hide a revival: a tree back at the path
+// within the day, with a pane using it, is inspected and kept pane-in-use, not
+// dropped silently (hk 6992). Fails without the pane guard on the gate.
+func TestReapReviewerAbsentSettleKeepsRevivalWithPane(t *testing.T) {
+	f := newReviewerFix(t)
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	host := f.s.Config.Hosts[0].Name
+	pr := 12
+	label := reviewerLabelFor(pr, time.Hour)
+	path := "/work/" + label + reviewerCheckoutSuffix
+	f.sink.recs[label] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: label, Host: host}
+	seedReapRows(t, f.s, testRepo.Name, removedStreamRows(pr, label, path, host)...)
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+
+	f.hub.detached[path] = true
+	f.addPane("fixture-pane-b", "other", path)
+	f.s.Now = func() time.Time { return reviewerNow.Add(time.Hour) }
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if removes := f.hub.ops("worktree.remove"); len(removes) != 0 {
+		t.Fatalf("removes: %v", removes)
+	}
+	rows := f.rows(t)
+	if last := rows[len(rows)-1]; last.Result != "kept" || last.Reason != "pane-in-use" || last.Worktree != path {
+		t.Fatalf("revival was not kept: %v", rowSummary(rows))
+	}
+}
+
+// Each absent answer more than a day apart is a new row, so the stream settles
+// again after the day: the third pass inside the next window inspects nothing
+// (hk 6992). Fails when a repeated absent answer is dropped as a repeat.
+func TestReapReviewerAbsentSettleRepeatsAfterADay(t *testing.T) {
+	f := newReviewerFix(t)
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	host := f.s.Config.Hosts[0].Name
+	pr := 12
+	label := reviewerLabelFor(pr, time.Hour)
+	path := "/work/" + label + reviewerCheckoutSuffix
+	f.sink.recs[label] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: label, Host: host}
+	seedReapRows(t, f.s, testRepo.Name, removedStreamRows(pr, label, path, host)...)
+	inspects := func() int {
+		n := 0
+		for _, op := range f.hub.ops("worktree.inspect") {
+			if op["cwd"] == path {
+				n++
+			}
+		}
+		return n
+	}
+	at := func(d time.Duration) {
+		f.s.Now = func() time.Time { return reviewerNow.Add(d) }
+	}
+	at(0)
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	at(25 * time.Hour)
+	before := inspects()
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if inspects() == before {
+		t.Fatalf("second absent answer was not inspected after a day")
+	}
+	rows := f.rows(t)
+	if n := 0; true {
+		for _, r := range rows {
+			if r.Result == "skipped" && strings.HasPrefix(r.Reason, reviewerRemovedAbsent) {
+				n++
+			}
+		}
+		if n != 2 {
+			t.Fatalf("absent answers recorded: %d, want 2: %v", n, rowSummary(rows))
+		}
+	}
+	at(26 * time.Hour)
+	before = inspects()
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := inspects(); got != before {
+		t.Fatalf("settled path inspected again inside the window: %d", got-before)
+	}
+}
+
+// Held removed re-inspects take turns: a label the allowance held is the next
+// full sweep's first candidate, so the failing paths that sort before it do not
+// hold it forever (hk 6992). Fails without the sweep cursor for held labels.
+func TestReapReviewerHeldRemovedLabelTakesNextTurn(t *testing.T) {
+	f := newReviewerFix(t)
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	host := f.s.Config.Hosts[0].Name
+	f.s.Config.Reap.ReviewerDrain = config.ReviewerDrain{PerHost: 10}
+	var seeded []reapReceipt
+	errs := map[string]string{}
+	var lastPath string
+	for i := range removedProbesPerHost + 1 {
+		pr := 100 + i
+		label := reviewerLabelFor(pr, time.Hour)
+		path := "/work/" + label + reviewerCheckoutSuffix
+		f.sink.recs[label] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: label, Host: host}
+		seeded = append(seeded, removedStreamRows(pr, label, path, host)...)
+		if i < removedProbesPerHost {
+			errs[path] = "timeout"
+		} else {
+			f.hub.detached[path] = true
+			lastPath = path
+		}
+	}
+	seedReapRows(t, f.s, testRepo.Name, seeded...)
+	f.hub.inspectErr = errs
+
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	f.hub.inspectErr = errs
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	removed := false
+	for _, op := range f.hub.ops("worktree.remove") {
+		if op["cwd"] == lastPath {
+			removed = true
+		}
+	}
+	if !removed {
+		t.Fatalf("held label never took its turn: removes %v", f.hub.ops("worktree.remove"))
+	}
 }

@@ -309,13 +309,21 @@ func reviewerWaiting(v reapReceipt, now time.Time) bool {
 // marker, or an absent answer that settled the label (hk 6992).
 func reviewerReprobe(v reapReceipt) bool {
 	return (v.Result == "pending-cleanup" && v.Reason == reviewerRemovedReprobe) ||
-		(v.Result == "skipped" && v.Reason == reviewerRemovedAbsent)
+		(v.Result == "skipped" && strings.HasPrefix(v.Reason, reviewerRemovedAbsent))
+}
+
+// reviewerRemovedAbsentReason is the reason of an absent answer at instant now.
+// Each answer carries its instant, so a later absent answer is a new row: an
+// identical reason would be dropped as a repeat and the stream would never
+// settle again (hk 6992).
+func reviewerRemovedAbsentReason(now time.Time) string {
+	return reviewerRemovedAbsent + " (" + now.UTC().Format(time.RFC3339) + ")"
 }
 
 // reviewerAbsentSettled reports whether a removed path that re-inspected with no
 // tree is not due for another inspect yet.
 func reviewerAbsentSettled(v reapReceipt, now time.Time) bool {
-	return v.Result == "skipped" && v.Reason == reviewerRemovedAbsent && now.Sub(v.Time) < reviewerRemovedAbsentAfter
+	return v.Result == "skipped" && strings.HasPrefix(v.Reason, reviewerRemovedAbsent) && now.Sub(v.Time) < reviewerRemovedAbsentAfter
 }
 
 // reviewerLabelOf names the label a reviewer receipt is about. A
@@ -2243,7 +2251,9 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		return remoteDone
 	case reviewerWaiting(prior, w.now):
 		return remoteStop
-	case reviewerAbsentSettled(prior, w.now):
+	case reviewerAbsentSettled(prior, w.now) && !hs.paneInUse(cwd):
+		// A pane still using the path is a revival: it is inspected below, so
+		// the pane-in-use row keeps the label retried (hk 6992).
 		return remoteDone
 	}
 	// A removed stream's worktree may be recreated at the same path by a
@@ -2255,6 +2265,9 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 	recreated := prior.Result == "removed" || reviewerReprobe(prior)
 	if recreated {
 		if !w.takeRemovedProbe(hs.host.Name) {
+			// The hold is the sweep's first waiting removed label: the next
+			// full sweep starts with it, so held labels take turns (hk 6992).
+			w.noteProbeHeld(l.name, hs.host.Name)
 			w.noteReprobe(rec, prior)
 			return remotePathUnknown
 		}
@@ -2266,7 +2279,7 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		// An absent tree settles the stream (hk 6992); the next re-inspect waits
 		// reviewerRemovedAbsentAfter.
 		if tree == nil {
-			w.record(rec, "skipped", reviewerRemovedAbsent)
+			w.record(rec, "skipped", reviewerRemovedAbsentReason(w.now))
 			return remoteDone
 		}
 	}
@@ -2357,7 +2370,7 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		w.record(rec, "error", "worktree inspect: "+e.Error())
 		return remoteStop
 	case tree == nil && recreated:
-		w.record(rec, "skipped", reviewerRemovedAbsent)
+		w.record(rec, "skipped", reviewerRemovedAbsentReason(w.now))
 		return remoteDone
 	case tree == nil:
 		w.record(rec, "skipped", reviewerAlreadyGone)
