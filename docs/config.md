@@ -1187,9 +1187,12 @@ on it.
     --pr <owner/repo#n> --head <sha> --requester mergewake/<owner/repo>#<n> --json` through the hub credential
     (`reap.hub`). A PR without a Mergewake-Task trailer skips the consult. The row lives in the round-rule state
     file, keyed by the head it was requested for. Later passes read a non-terminal row with
-    `GET /v1/consults/{id}` (over `reap.hub`, whatever `reap.transport` is) and never re-request it (a re-POST of a
-    terminal row would retry it), until `review.round_rule.hub_consult_wait` (default 2h, the hub's consult timeout)
-    passes; the wait also bounds a failed task read or question write, and it is measured from the first attempt.
+    `GET /v1/consults/{id}` (over `reap.hub`, whatever `reap.transport` is) and never re-request it, until
+    `review.round_rule.hub_consult_wait` (default 2h, the hub's consult timeout) passes; the wait also bounds a
+    failed task read or question write, and it is measured from the first attempt.
+    A POST whose response was lost is safe to repeat: the hub keys a consult by (task, PR, head) and returns the
+    existing row for a live or answered consult, so no second consult starts. Only a refused or failed row is planned
+    again under the same key, as a new attempt.
     The obligation is owed until its outcome is delivered, whatever the current review round or head says. A push
     before the answer does not drop the consult: the row is still followed on the hub (never POSTed again, its
     question document never rewritten) and its outcome goes out once with the next author delivery, naming the head
