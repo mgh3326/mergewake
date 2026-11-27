@@ -150,14 +150,14 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 		return nil, fmt.Errorf("check shallow repository: %w", err)
 	}
 	if shallow == "true" {
-		return nil, errors.New("base-drop check requires complete commit history; checkout is shallow")
+		return nil, &baseDropUnverified{cause: "shallow", err: errors.New("base-drop check requires complete commit history; checkout is shallow")}
 	}
 	fetch := pr
 	if fetch.Base.Ref == "" {
 		fetch.Base.Ref = pr.Base.SHA
 	}
 	if _, err := s.fetchPRHead(ctx, root, r.Name, fetch); err != nil {
-		return nil, fmt.Errorf("fetch PR refs: %w", err)
+		return nil, &baseDropUnverified{cause: "fetch", err: fmt.Errorf("fetch PR refs: %w", err)}
 	}
 	have := func(sha string) bool {
 		_, err := field("cat-file", "-e", sha+"^{commit}")
@@ -181,7 +181,7 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 	}
 	merges := nonemptyLines(mergesText)
 	if len(merges) > baseDropMergeLimit {
-		return nil, fmt.Errorf("PR has more than %d first-parent merges", baseDropMergeLimit)
+		return nil, &baseDropUnverified{cause: "history_limit", err: fmt.Errorf("PR has more than %d first-parent merges", baseDropMergeLimit)}
 	}
 	affected := map[string]bool{}
 	commitsSeen := map[string]bool{}
@@ -218,7 +218,7 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 		}
 		introduced := nonemptyLines(introducedText)
 		if len(introduced) > baseDropCommitLimit-len(commitsSeen) {
-			return nil, fmt.Errorf("base history exceeds %d commits", baseDropCommitLimit)
+			return nil, &baseDropUnverified{cause: "history_limit", err: fmt.Errorf("base history exceeds %d commits", baseDropCommitLimit)}
 		}
 		for _, commit := range introduced {
 			if commitsSeen[commit] {
@@ -250,7 +250,7 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 				}
 				lineCount += atSecondParent
 				if lineCount > baseDropLineLimit {
-					return nil, fmt.Errorf("base history exceeds %d added lines", baseDropLineLimit)
+					return nil, &baseDropUnverified{cause: "history_limit", err: fmt.Errorf("base history exceeds %d added lines", baseDropLineLimit)}
 				}
 				if atSecondParent == 0 {
 					continue
@@ -281,6 +281,38 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 
 type baseDropResult struct {
 	commits []string
+}
+
+// baseDropUnverified is a base-drop check that could not reach a verdict. Its
+// cause is a short token the gate reason carries as base_drop_unverified:<cause>.
+type baseDropUnverified struct {
+	cause string
+	err   error
+}
+
+func (e *baseDropUnverified) Error() string { return e.err.Error() }
+
+func (e *baseDropUnverified) Unwrap() error { return e.err }
+
+const baseDropUnverifiedPrefix = "base_drop_unverified:"
+
+// baseDropUnverifiedReason is the gate reason for a base-drop check that failed.
+func baseDropUnverifiedReason(err error) string {
+	var unverified *baseDropUnverified
+	if errors.As(err, &unverified) {
+		return baseDropUnverifiedPrefix + unverified.cause
+	}
+	return baseDropUnverifiedPrefix + "error"
+}
+
+// unverifiedBaseDrop returns the base_drop_unverified reason in reasons, or "".
+func unverifiedBaseDrop(reasons []string) string {
+	for _, reason := range reasons {
+		if strings.HasPrefix(reason, baseDropUnverifiedPrefix) {
+			return reason
+		}
+	}
+	return ""
 }
 
 func baseDropCacheKey(kind, base, head string) string { return kind + "\x00" + base + "\x00" + head }
@@ -337,7 +369,10 @@ func fileLineOriginCount(git func(...string) (string, error), revision, path, or
 		return counts[origin], nil
 	}
 	pathspec := ":(literal)" + path
-	text, err := git("blame", "--root", "--line-porcelain", revision, "--", path)
+	// --porcelain prints each commit's info block once, where --line-porcelain
+	// repeats it for every line. Each line still starts with its own header
+	// line, so the line-origin count below reads the same from either form.
+	text, err := git("blame", "--root", "--porcelain", revision, "--", path)
 	if err != nil {
 		// A missing path has no blamed lines. Query one literal path so a
 		// missing blob or other object error still fails closed.
@@ -352,7 +387,7 @@ func fileLineOriginCount(git func(...string) (string, error), revision, path, or
 		return 0, err
 	}
 	if len(text) >= 4<<20 {
-		return 0, fmt.Errorf("base-drop blame for %s exceeds runner output limit", path)
+		return 0, &baseDropUnverified{cause: "blame_limit", err: fmt.Errorf("base-drop blame for %s exceeds runner output limit", path)}
 	}
 	counts := map[string]int{}
 	for _, line := range strings.Split(text, "\n") {
