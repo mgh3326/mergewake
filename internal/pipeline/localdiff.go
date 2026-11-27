@@ -187,12 +187,13 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 		return nil, &baseDropUnverified{cause: "history_limit", err: fmt.Errorf("PR has more than %d first-parent merges", baseDropMergeLimit)}
 	}
 	affected := map[string]bool{}
-	// lost maps a base commit and path to the largest count of its lines that a
-	// merge's second parent had and the merge tree lost.
-	lost := map[string]map[string]int{}
+	// dropCandidates are base lines a merge lost: its second parent had them and
+	// its tree does not. Each is settled against the PR head below.
+	var dropCandidates []dropCandidate
+	candidateSeen := map[dropCandidate]bool{}
 	commitsSeen := map[string]bool{}
 	lineCount := 0
-	fileCache := map[string]map[string]map[string]int{}
+	blames := map[string][]blameLine{}
 	for _, merge := range merges {
 		parentsText, err := field("rev-list", "--parents", "-n", "1", merge)
 		if err != nil {
@@ -250,10 +251,11 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 				if path == "" {
 					continue
 				}
-				atSecondParent, err := fileLineOriginCount(git, parents[2], path, commit, fileCache)
+				secondParentLines, err := fileBlame(git, parents[2], path, blames)
 				if err != nil {
 					return nil, fmt.Errorf("read second-parent line origins for %s: %w", path, err)
 				}
+				atSecondParent := countOrigin(secondParentLines, commit)
 				lineCount += atSecondParent
 				if lineCount > baseDropLineLimit {
 					return nil, &baseDropUnverified{cause: "history_limit", err: fmt.Errorf("base history exceeds %d added lines", baseDropLineLimit)}
@@ -265,40 +267,46 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 				if renamed, ok := renames[path]; ok {
 					mergePath = renamed
 				}
-				inMerge, err := fileLineOriginCount(git, merge, mergePath, commit, fileCache)
+				mergeLines, err := fileBlame(git, merge, mergePath, blames)
 				if err != nil {
 					return nil, fmt.Errorf("read merge line origins for %s: %w", mergePath, err)
 				}
-				if inMerge < atSecondParent {
-					if lost[commit] == nil {
-						lost[commit] = map[string]int{}
+				if countOrigin(mergeLines, commit) < atSecondParent {
+					key := dropCandidate{commit: commit, base: parents[2], path: path}
+					if !candidateSeen[key] {
+						candidateSeen[key] = true
+						dropCandidates = append(dropCandidates, key)
 					}
-					lost[commit][mergePath] = max(lost[commit][mergePath], atSecondParent)
 				}
 			}
 		}
 	}
-	// A lost line counts only when the head does not carry it and the PR's net
-	// diff does not account for it. A merge resolution that edits a base line, or
-	// a later merge that restores it, shows in the net diff.
-	for commit, paths := range lost {
-		for path, expected := range paths {
-			atHead, err := fileLineOriginCount(git, pr.Head.SHA, path, commit, fileCache)
-			if err != nil {
-				return nil, fmt.Errorf("read head line origins for %s: %w", path, err)
+	// A base line a merge lost is dropped unless the PR head carries it
+	// verbatim. The check is count-aware per path: a text the head holds as
+	// many times as the base side does is carried. An intentional edit of a
+	// base line is therefore a drop; it has to be made in a regular commit
+	// after the merge, which the per-merge check does not attribute (hk 7021).
+	for _, c := range dropCandidates {
+		baseLines, err := fileBlame(git, c.base, c.path, blames)
+		if err != nil {
+			return nil, fmt.Errorf("read base-side line origins for %s: %w", c.path, err)
+		}
+		headLines, err := fileBlame(git, pr.Head.SHA, c.path, blames)
+		if err != nil {
+			return nil, fmt.Errorf("read head line texts for %s: %w", c.path, err)
+		}
+		baseAll, headAll := map[string]int{}, map[string]int{}
+		for _, line := range baseLines {
+			baseAll[line.text]++
+		}
+		for _, line := range headLines {
+			headAll[line.text]++
+		}
+		for _, line := range baseLines {
+			if line.origin == c.commit && baseAll[line.text] > headAll[line.text] {
+				affected[c.commit] = true
+				break
 			}
-			missing := expected - atHead
-			if missing <= 0 {
-				continue
-			}
-			added, err := netAddedLines(git, mergeBase, pr.Head.SHA, path)
-			if err != nil {
-				return nil, fmt.Errorf("read PR net diff for %s: %w", path, err)
-			}
-			if added >= missing {
-				continue
-			}
-			affected[commit] = true
 		}
 	}
 	var dropped []string
@@ -391,52 +399,54 @@ func renamedPaths(status string) map[string]string {
 	return result
 }
 
-// netAddedLines counts the lines the PR's net diff (base..head) adds to path. A
-// binary file has no line count and adds none.
-func netAddedLines(git func(...string) (string, error), base, head, path string) (int, error) {
-	text, err := git("diff", "--numstat", "-z", "--no-renames", base, head, "--", ":(literal)"+path)
-	if err != nil {
-		return 0, err
-	}
-	added, _, _ := strings.Cut(text, "\t")
-	if added == "" || added == "-" {
-		return 0, nil
-	}
-	return strconv.Atoi(added)
+// dropCandidate is a base commit's lines that a merge lost: the base side
+// (a merge's second parent) carries them at path and the merge does not.
+type dropCandidate struct {
+	commit string
+	base   string
+	path   string
 }
 
-func fileLineOriginCount(git func(...string) (string, error), revision, path, origin string, cache map[string]map[string]map[string]int) (int, error) {
-	byPath := cache[revision]
-	if byPath == nil {
-		byPath = map[string]map[string]int{}
-		cache[revision] = byPath
+// blameLine is one line of a file at a revision and the commit that last set it.
+type blameLine struct {
+	origin string
+	text   string
+}
+
+// fileBlame returns every line of path at revision with its blame origin. A
+// missing path has no lines. A runner that returns integrations.ErrOutputLimit
+// reports blame_limit.
+func fileBlame(git func(...string) (string, error), revision, path string, cache map[string][]blameLine) ([]blameLine, error) {
+	key := revision + "\x00" + path
+	if lines, ok := cache[key]; ok {
+		return lines, nil
 	}
-	if counts, ok := byPath[path]; ok {
-		return counts[origin], nil
-	}
-	pathspec := ":(literal)" + path
-	// --porcelain prints each commit's info block once, where --line-porcelain
-	// repeats it for every line. Each line still starts with its own header
-	// line, so the line-origin count below reads the same from either form.
+	// --porcelain prints each commit's info block once: a header line, its info
+	// lines, then one tab-prefixed line per file line.
 	text, err := git("blame", "--root", "--porcelain", revision, "--", path)
 	if err != nil {
 		if errors.Is(err, integrations.ErrOutputLimit) {
-			return 0, &baseDropUnverified{cause: "blame_limit", err: fmt.Errorf("base-drop blame for %s exceeds runner output limit", path)}
+			return nil, &baseDropUnverified{cause: "blame_limit", err: fmt.Errorf("base-drop blame for %s exceeds runner output limit", path)}
 		}
 		// A missing path has no blamed lines. Query one literal path so a
 		// missing blob or other object error still fails closed.
-		tree, treeErr := git("ls-tree", "-r", "--name-only", "-z", revision, "--", pathspec)
+		tree, treeErr := git("ls-tree", "-r", "--name-only", "-z", revision, "--", ":(literal)"+path)
 		if treeErr != nil {
-			return 0, treeErr
+			return nil, treeErr
 		}
 		if len(tree) == 0 {
-			byPath[path] = map[string]int{}
-			return 0, nil
+			cache[key] = nil
+			return nil, nil
 		}
-		return 0, err
+		return nil, err
 	}
-	counts := map[string]int{}
+	var lines []blameLine
+	origin := ""
 	for _, line := range strings.Split(text, "\n") {
+		if content, ok := strings.CutPrefix(line, "\t"); ok {
+			lines = append(lines, blameLine{origin: origin, text: content})
+			continue
+		}
 		fields := strings.Fields(line)
 		if len(fields) >= 3 && len(fields) <= 4 && len(fields[0]) >= 40 {
 			if _, err := strconv.Atoi(fields[1]); err != nil {
@@ -445,11 +455,21 @@ func fileLineOriginCount(git func(...string) (string, error), revision, path, or
 			if _, err := strconv.Atoi(fields[2]); err != nil {
 				continue
 			}
-			counts[strings.TrimPrefix(fields[0], "^")]++
+			origin = strings.TrimPrefix(fields[0], "^")
 		}
 	}
-	byPath[path] = counts
-	return counts[origin], nil
+	cache[key] = lines
+	return lines, nil
+}
+
+func countOrigin(lines []blameLine, origin string) int {
+	n := 0
+	for _, line := range lines {
+		if line.origin == origin {
+			n++
+		}
+	}
+	return n
 }
 
 // boundDiff applies reviewDiffBudget to a GitHub API patch. A patch within the

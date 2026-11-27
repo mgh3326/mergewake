@@ -53,6 +53,9 @@ func baseDropRepo(t *testing.T, mode string) (root, base, head string) {
 	if mode == "duplicate" {
 		baseText = "return nil\n"
 	}
+	if mode == "drop_beside_feature_addition" {
+		baseText = "legacy line\nmiddle\nend\n"
+	}
 	if mode == "duplicate_other_occurrence" {
 		baseText = "func A() {\nreturn nil\n}\nfunc B() {\nreturn errors.New(\"x\")\n}\n"
 	}
@@ -66,6 +69,8 @@ func baseDropRepo(t *testing.T, mode string) (root, base, head string) {
 		write("return nil\nreturn nil\n")
 	} else if mode == "duplicate_other_occurrence" {
 		write("func A() {\nreturn nil\n}\nfunc B() {\nreturn nil\nreturn errors.New(\"x\")\n}\n")
+	} else if mode == "drop_beside_feature_addition" {
+		write("legacy line\nmiddle\nend\nbase addition\n")
 	} else if mode == "doubleplus" {
 		write("legacy line\n++counter;\n")
 	} else if mode == "paths" {
@@ -97,6 +102,12 @@ func baseDropRepo(t *testing.T, mode string) (root, base, head string) {
 	baseDropGit(t, src, "switch", "-c", "feature", fork)
 	switch mode {
 	case "drop":
+		baseDropGit(t, src, "merge", "--no-ff", "-s", "ours", "main", "-m", "drop base addition")
+	case "drop_beside_feature_addition":
+		// The feature adds an unrelated line at the top of the same file, then
+		// drops the base's addition at the end: one added line, one lost line.
+		write("feature top\nlegacy line\nmiddle\nend\n")
+		baseDropGit(t, src, "commit", "-am", "feature adds a line at the top")
 		baseDropGit(t, src, "merge", "--no-ff", "-s", "ours", "main", "-m", "drop base addition")
 	case "duplicate", "doubleplus", "paths", "literal_path", "long_blame", "large":
 		baseDropGit(t, src, "merge", "--no-ff", "-s", "ours", "main", "-m", "drop base addition")
@@ -193,13 +204,16 @@ func TestGateBaseChangeDropped(t *testing.T) {
 		// An early merge edits the base's added line on purpose and a later
 		// merge restores it: the head carries the line, so no drop (hk 7021).
 		{mode: "edit_then_restore", want: ""},
-		// The #630 shape: the base's added line is edited on purpose in an early
-		// merge and kept edited. The PR's net diff shows the edit, so no drop.
-		{mode: "edit_kept", want: ""},
+		// The #630 shape: the base's added line is edited in a merge resolution
+		// and kept edited. The head no longer carries the line verbatim, so it
+		// counts as a drop. An intentional edit belongs in a regular commit.
+		{mode: "edit_kept", want: "base_change_dropped:1"},
+		// The merge drops the base addition, and the feature adds one unrelated
+		// line to the same file: a silent drop, not an edit (hk 7021 review).
+		{mode: "drop_beside_feature_addition", want: "base_change_dropped:1"},
 		// The base's added line is replaced by a combined line in the merge
-		// resolution and the head keeps it. The PR's net diff shows the
-		// replacement, so it is reviewed there rather than blocked as a drop.
-		{mode: "combine", want: ""},
+		// resolution. The head does not carry it verbatim, so it is a drop.
+		{mode: "combine", want: "base_change_dropped:1"},
 		{mode: "no_merge", want: ""},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
@@ -335,7 +349,7 @@ func TestBaseChangeDropNoticeNamesCommitsAndFix(t *testing.T) {
 	commit := strings.Repeat("c", 40)
 	v := gateVerdict{Reasons: []string{"base_change_dropped:1"}, BaseChangesDropped: []string{commit}}
 	notice := baseChangeDropNotice(v)
-	for _, want := range []string{commit, "origin/main", "ask the desk to rebuild the faulty merge"} {
+	for _, want := range []string{commit, "origin/main", "ask the desk to rebuild the faulty merge", "make the intentional edit in a regular commit after the merge"} {
 		if !strings.Contains(notice, want) {
 			t.Fatalf("notice %q does not contain %q", notice, want)
 		}
