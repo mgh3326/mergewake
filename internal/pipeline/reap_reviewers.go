@@ -439,7 +439,7 @@ func (s *Service) reapReviewers(ctx context.Context, r config.Repo, prNum int, r
 	}
 	visitCtx, cancelVisit := ctx, func() {}
 	for _, c := range cands {
-		if prNum == 0 && (w.oldPathRetry(c.label.name, c.host) || w.legacyPathPendingRetry(c.label.name, c.host)) {
+		if prNum == 0 && w.legacyFallback(c.label.name, c.host) {
 			// Keep time for later reap stages while old or still-pending legacy
 			// work is in the candidate set. The cursor resumes remaining labels.
 			visitCtx, cancelVisit = reapStageShare(ctx, 2, 3)
@@ -859,6 +859,13 @@ func (w *reviewerSweep) oldPathRetry(label, host string) bool {
 		}
 	}
 	return missingSuffixedPath && !legacyPathVisited
+}
+
+// legacyFallback reports whether the sweep will refresh and inspect the
+// pre-suffix path of a label: a fresh retry or a pending one. Both spend the
+// host's legacy probe allowance.
+func (w *reviewerSweep) legacyFallback(label, host string) bool {
+	return w.oldPathRetry(label, host) || w.legacyPathPendingRetry(label, host)
 }
 
 // legacyPathPendingRetry reports a reopened already-gone label whose legacy
@@ -1993,6 +2000,13 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		w.record(rec, "kept", "pane-scan-failed")
 		return remoteStop
 	}
+	if filepath.Base(filepath.Clean(cwd)) == l.name && w.legacyFallback(l.name, hs.host.Name) && !w.takeLegacyProbe(hs.host.Name) {
+		// A label already recorded on the pre-suffix path (a pending legacy
+		// retry) probes that path here, so it spends the allowance too.
+		rec.Action = "reviewer-cleanup"
+		w.record(rec, "pending-cleanup", reviewerLegacyProbeHold)
+		return remoteStop
+	}
 	if w.acting {
 		// A pane may have moved into the worktree since discovery.
 		if e := hs.refreshPanes(ctx); e != nil {
@@ -2010,7 +2024,7 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 	// the source of this cleanup is visible and terminal rows stop repeating.
 	if e == nil && tree == nil && filepath.Base(filepath.Clean(cwd)) == l.name+reviewerCheckoutSuffix {
 		if legacy := reviewerLegacyWorktreePath(hs, l); legacy != "" {
-			if w.oldPathRetry(l.name, hs.host.Name) && !w.takeLegacyProbe(hs.host.Name) {
+			if w.legacyFallback(l.name, hs.host.Name) && !w.takeLegacyProbe(hs.host.Name) {
 				// Keep the hold separate from the reviewer-reap stream so the
 				// original already-gone row continues to make this label a candidate.
 				rec.Action = "reviewer-cleanup"

@@ -353,6 +353,61 @@ func TestReapReviewerLegacyPathProbesHaveIndependentPerHostCap(t *testing.T) {
 	}
 }
 
+// A legacy inspect that finds a changed identity leaves its label pending. The
+// next pass retries that label through the legacy path, and the retry must
+// spend the same per-host probe allowance as the first attempt.
+func TestReapReviewerLegacyPendingRetryChargesProbeAllowance(t *testing.T) {
+	const labelCount = reviewerLegacyProbesPerHost + 1
+	f := newReviewerFix(t)
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	f.hub.wtHead = "bbbb2222"
+	var initial []reapReceipt
+	labels := make([]string, 0, labelCount)
+	for i := range labelCount {
+		label := reviewerLabelFor(70+i, 3*24*time.Hour)
+		labels = append(labels, label)
+		f.hub.detached["/work/"+label] = true
+		initial = append(initial, reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: 70 + i,
+			Host: "node-a", Label: label, Worktree: "/work/" + label + reviewerCheckoutSuffix,
+			Result: "skipped", Reason: reviewerAlreadyGone})
+	}
+	seedReapRows(t, f.s, testRepo.Name, initial...)
+	legacyInspects := func(ops []map[string]any) int {
+		n := 0
+		for _, op := range ops {
+			for _, label := range labels {
+				if op["cwd"] == "/work/"+label {
+					n++
+				}
+			}
+		}
+		return n
+	}
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	before := len(f.hub.ops("worktree.inspect"))
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := legacyInspects(f.hub.ops("worktree.inspect")[before:]); got > reviewerLegacyProbesPerHost {
+		t.Fatalf("second pass legacy inspects=%d, want at most %d", got, reviewerLegacyProbesPerHost)
+	}
+	all, err := f.s.reapReceipts(testRepo.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := 0
+	for _, row := range all {
+		if row.Action == "reviewer-cleanup" && row.Result == "pending-cleanup" && row.Reason == reviewerLegacyProbeHold {
+			held++
+		}
+	}
+	if held == 0 {
+		t.Fatalf("no label past the allowance got the legacy probe hold row: %v", rowSummary(all))
+	}
+}
+
 func TestReapReviewerAbsentLegacyPathsDoNotUsePerHostDrain(t *testing.T) {
 	f := newReviewerFix(t)
 	f.s.Config.Hosts[0].WorkRoot = "/work"
