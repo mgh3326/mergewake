@@ -321,7 +321,7 @@ func baseChangeDropNotice(v gateVerdict, branches ...string) string {
 		if extra > 0 {
 			detail += fmt.Sprintf(" and %d more", extra)
 		}
-		return detail + "; ask the desk to rebuild the faulty merge from origin/" + branch + " while preserving PR changes after review"
+		return detail + "; an edit of a base line made in a merge resolution counts as a drop: make the intentional edit in a regular commit after the merge; ask the desk to rebuild the faulty merge from origin/" + branch + " while preserving PR changes after review"
 	}
 	return ""
 }

@@ -28,6 +28,11 @@ type Runner interface {
 	Run(context.Context, string, []string, string, string) ([]byte, error)
 }
 
+// ErrOutputLimit reports a successful command whose stdout or stderr exceeded
+// the runner's output bound, so its output was not kept. Callers that need the
+// whole output match it with errors.Is.
+var ErrOutputLimit = errors.New("command output exceeds limit")
+
 // Exec runs each command as its own process group. ReapGroup kills the group
 // after every exit (one-shot reviewers); Grace bounds SIGTERM before SIGKILL.
 type Exec struct {
@@ -95,7 +100,7 @@ func (x Exec) runEnv(ctx context.Context, command string, args []string, input, 
 		return nil, e
 	}
 	if out.overflow || stderr.overflow {
-		return nil, errors.New("command output exceeds limit")
+		return nil, ErrOutputLimit
 	}
 	return out.Bytes(), nil
 }
