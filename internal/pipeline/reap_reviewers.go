@@ -351,7 +351,11 @@ type reviewerSweep struct {
 	// hostlessProbes is the probes of host-less checkout paths each host took
 	// this pass.
 	hostlessProbes map[string]int
-	hostRank       map[string]int
+	// ambiguousProbes is the probes a pending ambiguous host-less label took on
+	// each host this pass. It is its own allowance, so revisits of ambiguous
+	// labels never spend the one new labels are probed with.
+	ambiguousProbes map[string]int
+	hostRank        map[string]int
 	// paneHost maps a PR and pane id to the host a receipt recorded for it,
 	// the fallback when a leaked label's audit row names no host. A key two
 	// hosts claim is not used: the pane id alone would be a guess.
@@ -861,12 +865,6 @@ func (w *reviewerSweep) candidates(lastCleanup map[string]reapReceipt, prNum int
 	sort.SliceStable(cands, func(i, j int) bool {
 		if ri, rj := w.rank(cands[i].host), w.rank(cands[j].host); ri != rj {
 			return ri < rj
-		}
-		// A label whose checkout several hosts hold is revisited after the other
-		// labels on its rank, so its re-probes spend the allowance only after
-		// every label not yet ambiguous has had its share of the pass.
-		if ai, aj := w.ambiguousCopies(cands[i].label) != nil, w.ambiguousCopies(cands[j].label) != nil; ai != aj {
-			return aj
 		}
 		return cands[i].label.name < cands[j].label.name
 	})
@@ -2047,6 +2045,10 @@ func (w *reviewerSweep) findUnrecordedCheckout(ctx context.Context, l reviewerLa
 	if !w.acting {
 		return nil, nil, false, "", nil
 	}
+	take := w.takeHostlessProbe
+	if w.ambiguousCopies(l) != nil {
+		take = w.takeAmbiguousProbe
+	}
 	for _, hs := range w.hosts {
 		if hs.host.Local() || (only != nil && !only[hs.host.Name]) {
 			continue
@@ -2056,7 +2058,7 @@ func (w *reviewerSweep) findUnrecordedCheckout(ctx context.Context, l reviewerLa
 			uncertain = append(uncertain, hs.host.Name)
 			continue
 		}
-		if !w.takeHostlessProbe(hs.host.Name) {
+		if !take(hs.host.Name) {
 			uncertain = append(uncertain, hs.host.Name)
 			blocked = true
 			if capped == "" {
@@ -2083,6 +2085,20 @@ func (w *reviewerSweep) findUnrecordedCheckout(ctx context.Context, l reviewerLa
 		found = nil
 	}
 	return found, uncertain, blocked, capped, copies
+}
+
+// takeAmbiguousProbe spends one host's probe for a revisit of an ambiguous
+// host-less label. Its allowance is separate from the probes of labels not yet
+// probed, so new labels are never starved by ambiguous revisits.
+func (w *reviewerSweep) takeAmbiguousProbe(host string) bool {
+	if w.ambiguousProbes == nil {
+		w.ambiguousProbes = map[string]int{}
+	}
+	if w.ambiguousProbes[host] >= reviewerHostlessProbesPerHost {
+		return false
+	}
+	w.ambiguousProbes[host]++
+	return true
 }
 
 // takeHostlessProbe spends one host's probe of the spec checkout path for
