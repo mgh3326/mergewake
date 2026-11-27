@@ -56,6 +56,11 @@ type reapReceipt struct {
 	// RetryAfter is the deadline of a kept not-closable row's backoff. A later
 	// invocation, a fresh process, retries once it has passed (hk 6014).
 	RetryAfter time.Time `json:"retry_after,omitzero"`
+
+	// FailedSince is when the unanswered hosts of a host-less label first
+	// failed, on the pending row that keeps the label open. The sweep's bounded
+	// wait for those hosts counts from it, so one failed pass never settles it.
+	FailedSince time.Time `json:"failed_since,omitzero"`
 }
 
 func worktreeRemoveVerdict(v reap.WorktreeRemoveResult) (result, reason string) {
