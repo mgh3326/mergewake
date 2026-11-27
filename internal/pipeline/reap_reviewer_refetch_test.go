@@ -45,6 +45,10 @@ func TestReapReviewerHeldRowsDoNotRefetchTheirPRs(t *testing.T) {
 			Result: "pending-cleanup", Reason: reviewerLegacyProbeHold,
 			Time: time.Now().Add(-25 * time.Hour).UTC()})
 	}
+	// The base wrote a check-pr stamp per refetch: an old one left by a
+	// reviewer hold must not queue the PR either.
+	rows = append(rows, reapReceipt{Action: "check-pr", Repo: testRepo.Name, PR: 90, Result: "checked",
+		Time: time.Now().Add(-25 * time.Hour).UTC()})
 	seedReapRows(t, s, testRepo.Name, rows...)
 	_ = s.Reap(context.Background(), testRepo, 0, Options{})
 	for pr := 90; pr <= 93; pr++ {
@@ -55,13 +59,14 @@ func TestReapReviewerHeldRowsDoNotRefetchTheirPRs(t *testing.T) {
 }
 
 // A worker row naming a PR the merged listing missed still refetches it once
-// the day's backoff has passed.
+// the day's backoff has passed, even beside an old check-pr stamp.
 func TestReapWorkerRowUnlistedPRIsRefetched(t *testing.T) {
 	gh := &pullLog{}
 	r := &scriptRunner{outs: worktreeOuts("/repo")}
 	s := svc(t, gh, r)
 	seedReapRows(t, s, testRepo.Name,
 		reapReceipt{Action: "close-pane", Repo: testRepo.Name, PR: 77, Host: "local", Worktree: "/stale.wt", Result: "closed", Time: time.Now().Add(-25 * time.Hour).UTC()},
+		reapReceipt{Action: "check-pr", Repo: testRepo.Name, PR: 77, Result: "checked", Time: time.Now().Add(-25 * time.Hour).UTC()},
 	)
 	_ = s.Reap(context.Background(), testRepo, 0, Options{})
 	if !gh.fetched(77) {
