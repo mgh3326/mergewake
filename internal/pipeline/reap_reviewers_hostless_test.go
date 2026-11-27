@@ -1,0 +1,135 @@
+package pipeline
+
+import (
+	"testing"
+	"time"
+
+	"github.com/mgh3326/mergewake/internal/integrations"
+	"github.com/mgh3326/mergewake/internal/reap"
+)
+
+// A host-less label's checkout is held by one host. When that host is found
+// and the only doubt is a host that is down, the checkout is removed on the
+// found host, and the label stays pending for the down host alone: the next
+// pass probes that host and no other.
+func TestReapReviewerHostlessUniqueHostRemovesWhileADownHostStaysPending(t *testing.T) {
+	f := newReviewerFix(t, reap.Host{Name: "node-b", Machine: "node-b", WorkRoot: "/work-b"}, reap.Host{Name: "node-c", Machine: "node-c", WorkRoot: "/work-c"})
+	f.s.Config.Hosts[0].WorkRoot = "/work-a"
+	f.hub.moreNodes = []any{
+		map[string]any{"machine_id": "node-b", "state": "connected", "agents": []any{}, "panes": []any{}, "panes_ok": true},
+		map[string]any{"machine_id": "node-c", "state": "connected", "agents": []any{}, "panes": []any{}, "panes_ok": true},
+	}
+	label := reviewerLabelFor(90, 2*24*time.Hour)
+	pathA := "/work-a/" + label + reviewerCheckoutSuffix
+	pathB := "/work-b/" + label + reviewerCheckoutSuffix
+	f.hub.detached[pathA] = true
+	f.hub.inspectErr = map[string]string{pathB: "node_timeout"}
+	seedDecisionRows(t, f.s, testRepo.Name, map[string]any{"command": "reviewer-held", "value": map[string]any{"pr": 90, "label": label}})
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if removes := f.hub.ops("worktree.remove"); len(removes) != 1 || removes[0]["cwd"] != pathA {
+		t.Fatalf("pass 1 removes %v; rows %v", removes, rowSummary(f.rows(t)))
+	}
+	wantPending := reviewerHostsPendingPrefix + "node-b" + reviewerHostsPendingSuffix
+	pending := 0
+	for _, row := range f.rows(t) {
+		if row.Result == "pending-cleanup" && row.Host == "" && row.Reason == wantPending {
+			pending++
+		}
+	}
+	if pending != 1 {
+		t.Fatalf("want one pending row naming only node-b; rows %v", rowSummary(f.rows(t)))
+	}
+
+	before := len(f.hub.ops("worktree.inspect"))
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	probes := f.hub.ops("worktree.inspect")[before:]
+	if len(probes) == 0 {
+		t.Fatalf("pass 2 probed no host; rows %v", rowSummary(f.rows(t)))
+	}
+	for _, p := range probes {
+		if p["cwd"] != pathB {
+			t.Fatalf("pass 2 probed %v, want only %s", p["cwd"], pathB)
+		}
+	}
+	if removes := f.hub.ops("worktree.remove"); len(removes) != 1 {
+		t.Fatalf("pass 2 removed again: %v", removes)
+	}
+}
+
+// A host-less label whose only unanswered host is still down settles terminal
+// once its spawn is older than the bounded wait, and the row names the host
+// that was never probed.
+func TestReapReviewerHostlessDownHostSettlesTerminalAfterTheBoundedWait(t *testing.T) {
+	f := newReviewerFix(t, reap.Host{Name: "node-b", Machine: "node-b", WorkRoot: "/work-b"}, reap.Host{Name: "node-c", Machine: "node-c", WorkRoot: "/work-c"})
+	f.s.Config.Hosts[0].WorkRoot = "/work-a"
+	f.hub.moreNodes = []any{
+		map[string]any{"machine_id": "node-b", "state": "connected", "agents": []any{}, "panes": []any{}, "panes_ok": true},
+		map[string]any{"machine_id": "node-c", "state": "connected", "agents": []any{}, "panes": []any{}, "panes_ok": true},
+	}
+	label := reviewerLabelFor(91, reviewerHostlessMaxAge+time.Hour)
+	f.hub.inspectErr = map[string]string{"/work-b/" + label + reviewerCheckoutSuffix: "node_timeout"}
+	seedDecisionRows(t, f.s, testRepo.Name, map[string]any{"command": "reviewer-held", "value": map[string]any{"pr": 91, "label": label}})
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	rows := f.rows(t)
+	want := reviewerHostUnknown + reviewerHostUnprobed + "node-b"
+	if len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != want {
+		t.Fatalf("rows %v, want one kept row %q", rowSummary(rows), want)
+	}
+	nrows := len(rows)
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.rows(t)) != nrows {
+		t.Fatalf("terminal label revisited: %v", rowSummary(f.rows(t)))
+	}
+}
+
+// Host-less probes and legacy-path probes draw on separate allowances. The
+// sweep resumes past the legacy labels, so the host-less labels are visited
+// first on this host; the legacy labels still get their full allowance.
+func TestReapReviewerHostlessProbesDoNotStarveLegacyPathProbes(t *testing.T) {
+	f := newReviewerFix(t)
+	f.s.Config.Hosts[0].WorkRoot = "/work-a"
+	var decisions []map[string]any
+	for i := range reviewerHostlessProbesPerHost {
+		label := reviewerLabelFor(100+i, 2*24*time.Hour)
+		decisions = append(decisions, map[string]any{"command": "reviewer-held", "value": map[string]any{"pr": 100 + i, "label": label}})
+	}
+	seedDecisionRows(t, f.s, testRepo.Name, decisions...)
+	var legacy []string
+	var receipts []reapReceipt
+	for i := range reviewerLegacyProbesPerHost {
+		pr := 200 + i
+		label := reviewerLabelFor(pr, 2*24*time.Hour)
+		legacy = append(legacy, label)
+		f.sink.recs[label] = integrations.JobRecord{State: "completed", Role: "reviewer", Label: label, Host: "node-a"}
+		receipts = append(receipts, reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: pr, Host: "node-a", Label: label,
+			Worktree: "/work-a/" + label + reviewerCheckoutSuffix, Result: "skipped", Reason: reviewerAlreadyGone})
+		f.hub.detached["/work-a/"+label] = true
+	}
+	// seedReapRows rewrites the log, so every legacy row goes in one call.
+	seedReapRows(t, f.s, testRepo.Name, receipts...)
+	// A cursor past every legacy label makes the pass visit the host-less
+	// labels, which sort last, before the legacy labels on the host.
+	if err := f.s.saveReviewerSweepCursor(testRepo.Name, reviewerCursor{Host: f.s.Config.Hosts[0].Name, Label: "zzz"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	removed := map[string]bool{}
+	for _, rm := range f.hub.ops("worktree.remove") {
+		removed[rm["cwd"].(string)] = true
+	}
+	for _, label := range legacy {
+		if !removed["/work-a/"+label] {
+			t.Fatalf("legacy label %s was not removed; removes %v; rows %v", label, f.hub.ops("worktree.remove"), rowSummary(f.rows(t)))
+		}
+	}
+}
