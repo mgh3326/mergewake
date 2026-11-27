@@ -724,11 +724,23 @@ func pinOwes(streams map[string]reapReceipt, name string, w *reviewerSweep) bool
 }
 
 // owedConfiguredHost names the configured host of a label's newest open
-// worktree row: a checkout the sweep still owes a removal on that host. Only a
-// remote host that scanned readable this pass qualifies; a failed host or the
-// local host owes nothing the remote visit could reach (hk 7018). "" when no
-// stream of the label holds one on such a host.
+// worktree row that can progress this pass: a checkout the sweep still owes a
+// removal on that host. A kept identity-changed row or a refusal inside its
+// backoff cannot progress, so an older owed row on another host is chosen
+// instead (hk 7024). Only a remote host that scanned readable this pass
+// qualifies; a failed host or the local host owes nothing the remote visit
+// could reach (hk 7018). "" when no stream of the label holds one on such a
+// host. When no row can progress, the newest owed row is chosen as before.
 func (w *reviewerSweep) owedConfiguredHost(streams map[string]reapReceipt, skip string) string {
+	if host := w.newestOwedHost(streams, skip, true); host != "" {
+		return host
+	}
+	return w.newestOwedHost(streams, skip, false)
+}
+
+// newestOwedHost is the configured host of the newest owed row; with progress
+// set, rows that cannot progress this pass are passed over (hk 7024).
+func (w *reviewerSweep) newestOwedHost(streams map[string]reapReceipt, skip string, progress bool) string {
 	host := ""
 	var at time.Time
 	for _, v := range streams {
@@ -737,11 +749,21 @@ func (w *reviewerSweep) owedConfiguredHost(streams map[string]reapReceipt, skip 
 		if name == skip || v.Worktree == "" || reviewerTerminal(v) || reviewerCheckoutRemoved(v) || hs == nil || hs.failed || hs.host.Local() {
 			continue
 		}
+		if progress && cannotProgress(v, w.now) {
+			continue
+		}
 		if host == "" || v.Time.After(at) || (v.Time.Equal(at) && name < host) {
 			host, at = name, v.Time
 		}
 	}
 	return host
+}
+
+// cannotProgress reports whether a row's stream has nothing this pass can move
+// forward: a kept identity-changed row, or a refusal or hold still inside its
+// backoff (hk 7024).
+func cannotProgress(v reapReceipt, now time.Time) bool {
+	return (v.Result == "kept" && strings.HasSuffix(v.Reason, "identity changed")) || reviewerWaiting(v, now)
 }
 
 // initDrain bounds the pass's guarded removals per host and fixes the order
