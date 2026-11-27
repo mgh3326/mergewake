@@ -87,14 +87,17 @@ func TestFirstReviewRoundCountsOtherHeadsOnly(t *testing.T) {
 }
 
 // The task title's grade is a floor: panewire's explicit --grade overrides it,
-// so a round-one raise is not stated when the title grade is stronger.
+// so a round-one raise is not stated when the title grade is stronger. The
+// audit names the grade the spawn routes at: the title's when it wins, the
+// raise's when it is sent (hk 5726).
 func TestFirstRoundGradeFloorIsTaskTitle(t *testing.T) {
 	for name, tc := range map[string]struct {
 		title     string
 		wantFlag  string
 		wantAsked string
 	}{
-		"title stronger than the raise": {"Fix the thing (grade S, T1)", "", "A"},
+		"title stronger than the raise": {"Fix the thing (grade S, T1)", "", "S"},
+		"title weaker than the raise":   {"Fix the thing (grade C, T1)", "A", "A"},
 		"title equal to the raise":      {"Fix the thing (grade A, T2)", "A", "A"},
 	} {
 		t.Run(name, func(t *testing.T) {

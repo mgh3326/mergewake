@@ -982,7 +982,8 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 				args = append(args, "-w", cfg.Workspace)
 			}
 			args = append(args, "-l", label, "--t", scale, "--task", task)
-			if x.spawnGrade != "" && !gradeStronger(titleGrade, x.spawnGrade) {
+			sendGrade := x.spawnGrade != "" && !gradeStronger(titleGrade, x.spawnGrade)
+			if sendGrade {
 				args = append(args, "--grade", x.spawnGrade)
 			}
 			if parent != "" {
@@ -1018,7 +1019,21 @@ func (x *panewireExecutor) runPass(ctx context.Context, plan *passPlan, claim fu
 					return out, auditErr
 				}
 			}
-			rj = reviewerJob{PR: pr.Number, Head: pr.Head.SHA, LeaseSHA: leaseSHA, Pass: plan.pass, Label: label, Checkout: checkout, Args: append(slices.Clone(args), roleArgs...), Recorded: s.now(), Replacements: plan.replacements, Supersedes: plan.supersedes, Replaced: plan.replaced, Routing: x.routing}
+			// The job audits the grade panewire routes this spawn at: the --grade
+			// sent, else the task title's grade when the title's floor won. The
+			// shared routing decision stays as the run made it.
+			routing := x.routing
+			if routing != nil {
+				decided := *routing
+				switch {
+				case sendGrade:
+					decided.GradeAsked = x.spawnGrade
+				case x.spawnGrade != "":
+					decided.GradeAsked = titleGrade
+				}
+				routing = &decided
+			}
+			rj = reviewerJob{PR: pr.Number, Head: pr.Head.SHA, LeaseSHA: leaseSHA, Pass: plan.pass, Label: label, Checkout: checkout, Args: append(slices.Clone(args), roleArgs...), Recorded: s.now(), Replacements: plan.replacements, Supersedes: plan.supersedes, Replaced: plan.replaced, Routing: routing}
 			if e = x.saveReviewerJob(rj); e != nil {
 				return out, e
 			}
