@@ -223,10 +223,23 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 			if mixedHead {
 				return s.recoverHeadCulprit(ctx, r, p, head, checks, result, o, inc)
 			}
+			m, found, re := s.readRedSeen(r.Name)
+			if re != nil {
+				return re
+			}
+			if found && m.Culprit == head {
+				result.Action = "hold"
+				result.Reason = "mixed result: a passing rerun status sits beside the red check run; held, not reverted"
+				return s.reportWatch(ctx, r, result, head+":mixed", o)
+			}
 		}
 		return e
 	}
 	checkpoint := s.checkpoint(r.Name)
+	// A shadow or dry pass persists nothing: it never writes or reads the
+	// confirmation marker, so it keeps today's result.
+	acting := !result.Shadow && !o.DryRun
+	window := s.confirmWindow()
 	if ci == github.Green {
 		if !s.deploy && !o.DryRun {
 			if e = s.clearWatchHoldEpisode(r.Name); e != nil {
@@ -245,22 +258,14 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 				return nil
 			}
 		}
-		// A head red that turns green inside its confirmation window was a
-		// flake. Hold with a distinct reason, naming no PR and reverting nothing.
-		// The hold still tells a person main was red.
-		_, found, e := s.readRedSeen(r.Name)
-		if e != nil {
-			return e
-		}
-		if found {
-			if !result.Shadow && !o.DryRun {
-				if e = s.clearRedSeen(r.Name); e != nil {
-					return e
-				}
+		if acting {
+			settled, e := s.settleGreenHead(ctx, r, head, window, &result, o)
+			if e != nil {
+				return e
 			}
-			result.Action = "hold"
-			result.Reason = "flaky: red did not hold on rerun"
-			return s.reportWatch(ctx, r, result, head+":flaky", o)
+			if settled {
+				return nil
+			}
 		}
 		result.Action = "healthy"
 		if !o.DryRun {
@@ -502,8 +507,8 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 	// A head culprit has no later commit to corroborate its red. Its red is
 	// held for the confirmation window; a rerun that passes inside it settles
 	// the red as flaky, and the window's expiry confirms it as today.
-	if window := s.confirmWindow(); window > 0 {
-		held, e := s.confirmHeadRed(r, culprit, index == len(chain)-1, window, !result.Shadow && !o.DryRun)
+	if window > 0 && acting {
+		held, e := s.confirmHeadRed(r, culprit, index == len(chain)-1, window)
 		if e != nil {
 			return e
 		}
@@ -728,8 +733,14 @@ func (s *Service) reportWatch(ctx context.Context, r config.Repo, result watchRe
 	if result.Reason != "" {
 		note += ": " + result.Reason
 	}
-	e = errors.Join(s.Sink.Record(reportCtx, "mergewake/"+result.Action+"/"+result.Head, data),
-		s.Notifier.Notify(reportCtx, integrations.Event{ID: "mergewake-" + result.Action + "-" + result.Head, Type: "watch-hold", Text: note, Lane: s.ownerLane(r)}))
+	// The flaky outcome is its own hold: a first-sighting hold on the same head
+	// shares its event ID otherwise, and the notifier would drop it as duplicate.
+	kind := result.Action
+	if result.Action == "hold" && watchHoldReasonClass(result.Reason) == "flaky" {
+		kind = "hold-flaky"
+	}
+	e = errors.Join(s.Sink.Record(reportCtx, "mergewake/"+kind+"/"+result.Head, data),
+		s.Notifier.Notify(reportCtx, integrations.Event{ID: "mergewake-" + kind + "-" + result.Head, Type: "watch-hold", Text: note, Lane: s.ownerLane(r)}))
 	if e != nil {
 		return e
 	}
@@ -901,10 +912,12 @@ func (s *Service) recoveryTrailers(ctx context.Context, r config.Repo, pr github
 }
 
 // redSeen is the durable marker for a head culprit whose red is inside its
-// confirmation window: the commit and when it was first seen red.
+// confirmation window. Confirmed is written when the window expires: the culprit
+// is then named as today, and a later pass never holds it again.
 type redSeen struct {
-	Culprit string    `json:"culprit"`
-	Since   time.Time `json:"since"`
+	Culprit   string    `json:"culprit"`
+	Since     time.Time `json:"since"`
+	Confirmed bool      `json:"confirmed,omitempty"`
 }
 
 // redSeenFile is per stream, as the checkpoint is, so a deploy red never
@@ -931,46 +944,78 @@ func (s *watchStream) clearRedSeen(repo string) error {
 }
 
 // confirmWindow is how long a head culprit's red is held before it is named.
-// Zero disables the window, so a service whose config was never loaded (or an
-// operator who sets watch_confirm_window to 0) keeps today's single-pass result.
+// Zero disables the window; an operator sets it to 0 to get today's result.
 func (s *Service) confirmWindow() time.Duration {
 	if s.Config.WatchConfirmWindow == "" {
 		return 0
 	}
-	d, e := config.Duration(s.Config.WatchConfirmWindow)
+	d, e := config.OptionalDuration(s.Config.WatchConfirmWindow)
 	if e != nil {
 		return 0
 	}
 	return d
 }
 
-// confirmHeadRed reports whether culprit's red is still inside its confirmation
-// window, and so must be held. A head culprit records its first sighting on the
-// first pass and is confirmed once the window expires. A culprit with a later
-// red commit in the bracket is corroborated by it, so it is confirmed at once.
-func (s *watchStream) confirmHeadRed(r config.Repo, culprit string, headCulprit bool, window time.Duration, persist bool) (bool, error) {
+// confirmHeadRed reports whether culprit's red must be held. A head culprit has
+// no later commit to corroborate it: its first sighting starts the window, and
+// the first pass after the window confirms it durably, so no later pass can
+// hold it again even when a transient error stops this pass before it saves an
+// incident. A culprit with a later red commit in the bracket is corroborated by
+// it, so the marker is dropped and the culprit is named at once.
+func (s *watchStream) confirmHeadRed(r config.Repo, culprit string, headCulprit bool, window time.Duration) (bool, error) {
 	m, found, e := s.readRedSeen(r.Name)
 	if e != nil {
 		return false, e
 	}
 	if !headCulprit {
-		if found && persist {
+		if found {
 			return false, s.clearRedSeen(r.Name)
 		}
 		return false, nil
 	}
 	now := s.Service.now()
-	if !found || m.Culprit != culprit {
-		if persist {
-			return true, fsutil.WriteJSON(s.redSeenFile(r.Name), redSeen{Culprit: culprit, Since: now})
+	if found && m.Culprit == culprit {
+		if m.Confirmed {
+			return false, nil
+		}
+		if now.Sub(m.Since) >= window {
+			m.Confirmed = true
+			return false, fsutil.WriteJSON(s.redSeenFile(r.Name), m)
 		}
 		return true, nil
 	}
-	if now.Sub(m.Since) < window {
-		return true, nil
+	return true, fsutil.WriteJSON(s.redSeenFile(r.Name), redSeen{Culprit: culprit, Since: now})
+}
+
+// settleGreenHead runs when the head is green and a head-culprit marker exists.
+// A red that turned green inside its window was a flake: hold with a distinct
+// reason, naming no PR and reverting nothing, and clear the marker only after
+// the notice is out. A green descendant of the marked culprit (a fix forward,
+// or a manual revert) clears the marker and takes the healthy path. A green
+// ancestor of the culprit (the deploy stream's walk-back while a rerun runs)
+// keeps the marker and takes the healthy path. Returns true when the pass is
+// settled here.
+func (s *watchStream) settleGreenHead(ctx context.Context, r config.Repo, head string, window time.Duration, result *watchResult, o Options) (bool, error) {
+	m, found, e := s.readRedSeen(r.Name)
+	if e != nil || !found {
+		return false, e
 	}
-	if persist {
-		return false, s.clearRedSeen(r.Name)
+	if m.Culprit == head && !m.Confirmed && s.Service.now().Sub(m.Since) < window {
+		result.Action = "hold"
+		result.Reason = "flaky: red did not hold on rerun"
+		if e = s.reportWatch(ctx, r, *result, head+":flaky", o); e != nil {
+			return true, e
+		}
+		return true, s.clearRedSeen(r.Name)
 	}
-	return false, nil
+	if m.Culprit != head {
+		parent, e := s.GH.Commit(ctx, r.Name, m.Culprit)
+		if e != nil {
+			return false, e
+		}
+		if len(parent.Parents) > 0 && parent.Parents[0].SHA == head {
+			return false, nil
+		}
+	}
+	return false, s.clearRedSeen(r.Name)
 }

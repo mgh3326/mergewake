@@ -1077,7 +1077,7 @@ func validateBasics(c *Config) error {
 	if c.WatchConfirmWindow == "" {
 		c.WatchConfirmWindow = "30m"
 	}
-	if _, e = Duration(c.WatchConfirmWindow); e != nil {
+	if _, e = OptionalDuration(c.WatchConfirmWindow); e != nil {
 		return fmt.Errorf("watch_confirm_window: %w", e)
 	}
 	if _, e = Duration(c.PollInterval); e != nil {

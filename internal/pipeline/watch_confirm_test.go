@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -92,8 +93,9 @@ func TestWatchHeadCulpritConfirmationWindow(t *testing.T) {
 		if !strings.Contains(out.String(), `"action":"report-culprit"`) {
 			t.Fatal(out.String())
 		}
-		if _, e := os.Stat((&watchStream{Service: s}).redSeenFile(r.Name)); !os.IsNotExist(e) {
-			t.Fatalf("marker survives confirmation: %v", e)
+		m, found, e := (&watchStream{Service: s}).readRedSeen(r.Name)
+		if e != nil || !found || !m.Confirmed {
+			t.Fatalf("expiry did not confirm durably: %+v found=%v err=%v", m, found, e)
 		}
 	})
 
@@ -116,6 +118,85 @@ func TestWatchHeadCulpritConfirmationWindow(t *testing.T) {
 		}
 		if _, e := os.Stat((&watchStream{Service: s}).redSeenFile(r.Name)); !os.IsNotExist(e) {
 			t.Fatalf("marker survives corroboration: %v", e)
+		}
+	})
+}
+
+func TestWatchHeadCulpritMarkerSettlement(t *testing.T) {
+	t.Run("shadow pass keeps today's result and writes no marker", func(t *testing.T) {
+		s, g, _, out, _, r := headCulpritChain(t)
+		g.blocking = true
+		if e := s.Watch(context.Background(), r, Options{Shadow: true}); e != nil {
+			t.Fatal(e)
+		}
+		if !strings.Contains(out.String(), `"action":"report-culprit"`) {
+			t.Fatal(out.String())
+		}
+		if _, e := os.Stat((&watchStream{Service: s}).redSeenFile(r.Name)); !os.IsNotExist(e) {
+			t.Fatalf("shadow pass wrote a marker: %v", e)
+		}
+	})
+
+	t.Run("a transient error after expiry does not restart the window", func(t *testing.T) {
+		s, g, _, out, now, r := headCulpritChain(t)
+		g.blocking = true
+		if e := s.Watch(context.Background(), r, Options{}); e != nil {
+			t.Fatal(e)
+		}
+		*now = now.Add(31 * time.Minute)
+		g.pullErr = errors.New("transient")
+		if e := s.Watch(context.Background(), r, Options{}); e == nil {
+			t.Fatal("expected the transient error to surface")
+		}
+		g.pullErr = nil
+		*now = now.Add(time.Minute)
+		out.Reset()
+		if e := s.Watch(context.Background(), r, Options{}); e != nil {
+			t.Fatal(e)
+		}
+		if strings.Contains(out.String(), "unconfirmed") || !strings.Contains(out.String(), `"action":"report-culprit"`) {
+			t.Fatal(out.String())
+		}
+	})
+
+	t.Run("a green descendant clears the marker and takes the healthy path", func(t *testing.T) {
+		s, g, _, out, _, r := headCulpritChain(t)
+		g.blocking = true
+		if e := s.Watch(context.Background(), r, Options{}); e != nil {
+			t.Fatal(e)
+		}
+		g.head = shaC
+		g.parents = map[string]string{shaC: shaB, shaB: shaA}
+		g.checks = map[string]github.CI{shaC: github.Green, shaB: github.Red, shaA: github.Green}
+		out.Reset()
+		if e := s.Watch(context.Background(), r, Options{}); e != nil {
+			t.Fatal(e)
+		}
+		if !strings.Contains(out.String(), `"action":"healthy"`) {
+			t.Fatal(out.String())
+		}
+		if _, e := os.Stat((&watchStream{Service: s}).redSeenFile(r.Name)); !os.IsNotExist(e) {
+			t.Fatalf("descendant kept the marker: %v", e)
+		}
+	})
+
+	t.Run("a green ancestor keeps the marker", func(t *testing.T) {
+		s, g, _, out, _, r := headCulpritChain(t)
+		g.blocking = true
+		if e := s.Watch(context.Background(), r, Options{}); e != nil {
+			t.Fatal(e)
+		}
+		g.head = shaA
+		g.checks = map[string]github.CI{shaA: github.Green, shaB: github.Red}
+		out.Reset()
+		if e := s.Watch(context.Background(), r, Options{}); e != nil {
+			t.Fatal(e)
+		}
+		if strings.Contains(out.String(), "flaky") || !strings.Contains(out.String(), `"action":"healthy"`) {
+			t.Fatal(out.String())
+		}
+		if _, e := os.Stat((&watchStream{Service: s}).redSeenFile(r.Name)); e != nil {
+			t.Fatalf("ancestor dropped the marker: %v", e)
 		}
 	})
 }
