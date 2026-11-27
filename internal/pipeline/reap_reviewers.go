@@ -642,8 +642,10 @@ func (w *reviewerSweep) collect(receipts []reapReceipt) map[string]reapReceipt {
 			// that already recorded the checkout gone, releases the label to an
 			// owed host (hk 7018).
 			hs := w.scannedHost(name)
-			released := hs == nil || hs.failed || pinSettled(streams, name, w)
-			if owed := w.owedConfiguredHost(streams); owed != "" && released {
+			released := hs == nil || hs.failed || !pinOwes(streams, name, w)
+			// A released pin's own rows owe nothing here, so the owed pick
+			// falls through to the other hosts (hk 7018).
+			if owed := w.owedConfiguredHost(streams, name); owed != "" && released {
 				w.labelHost[label] = owed
 				if w.owedYield == nil {
 					w.owedYield = map[string]string{}
@@ -669,20 +671,19 @@ func unconfiguredJobHost(streams map[string]reapReceipt) string {
 	return host
 }
 
-// pinSettled reports whether the pinned host recorded the label's checkout on
-// it gone or removed, in a row newer than its open job-host-unconfigured row.
-// Such a pin owes nothing, and must not keep the label off the owed host.
-func pinSettled(streams map[string]reapReceipt, name string, w *reviewerSweep) bool {
-	var pinAt time.Time
+// pinOwes reports whether the pinned host still owes a checkout of the label:
+// an open row on its own checkout path, not the pin row and not terminal. A
+// pin whose host owes nothing releases the label once that host is configured
+// (hk 7018).
+func pinOwes(streams map[string]reapReceipt, name string, w *reviewerSweep) bool {
 	for _, v := range streams {
-		if v.Result == "kept" && v.Reason == "job-host-unconfigured" && w.hostName(v.Host) == name && v.Time.After(pinAt) {
-			pinAt = v.Time
+		if w.hostName(v.Host) != name || v.Worktree == "" || v.Worktree == v.Label || reviewerTerminal(v) || reviewerCheckoutRemoved(v) {
+			continue
 		}
-	}
-	for _, v := range streams {
-		if v.Worktree != "" && v.Worktree != v.Label && w.hostName(v.Host) == name && v.Time.After(pinAt) && (reviewerTerminal(v) || reviewerCheckoutRemoved(v)) {
-			return true
+		if v.Result == "kept" && v.Reason == "job-host-unconfigured" {
+			continue
 		}
+		return true
 	}
 	return false
 }
@@ -692,13 +693,13 @@ func pinSettled(streams map[string]reapReceipt, name string, w *reviewerSweep) b
 // remote host that scanned readable this pass qualifies; a failed host or the
 // local host owes nothing the remote visit could reach (hk 7018). "" when no
 // stream of the label holds one on such a host.
-func (w *reviewerSweep) owedConfiguredHost(streams map[string]reapReceipt) string {
+func (w *reviewerSweep) owedConfiguredHost(streams map[string]reapReceipt, skip string) string {
 	host := ""
 	var at time.Time
 	for _, v := range streams {
 		name := w.hostName(v.Host)
 		hs := w.scannedHost(name)
-		if v.Worktree == "" || reviewerTerminal(v) || reviewerCheckoutRemoved(v) || hs == nil || hs.failed || hs.host.Local() {
+		if name == skip || v.Worktree == "" || reviewerTerminal(v) || reviewerCheckoutRemoved(v) || hs == nil || hs.failed || hs.host.Local() {
 			continue
 		}
 		if host == "" || v.Time.After(at) || (v.Time.Equal(at) && name < host) {
