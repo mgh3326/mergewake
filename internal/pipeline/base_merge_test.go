@@ -224,3 +224,53 @@ func TestReviewSchedulesBaseMergeOfConflictedMerge(t *testing.T) {
 		t.Fatalf("a base merge behind a conflicted merge was not reviewed: calls=%d passes=%d", runner.calls, len(g.passes[shaD]))
 	}
 }
+
+// hunkBody is one "@@" hunk holding lines (each starting with ' ', '+', '-' or
+// '\'); the hunk counts are derived from them.
+func hunkBody(lines ...string) string {
+	oldN, newN := 0, 0
+	for _, l := range lines {
+		switch l[0] {
+		case ' ':
+			oldN++
+			newN++
+		case '-':
+			oldN++
+		case '+':
+			newN++
+		}
+	}
+	var b strings.Builder
+	b.WriteString("@@ -1," + itoa(oldN) + " +1," + itoa(newN) + " @@\n")
+	for _, l := range lines {
+		b.WriteString(l + "\n")
+	}
+	return b.String()
+}
+
+// A clean base merge that splits an unchanged gap in an elided file changes the
+// digest (the position of the + lines is part of it), so its patch id differs
+// from the reviewed head's. It still inherits that review through
+// cleanBaseMergePasses, which checks the merge itself: no pass is scheduled.
+func TestReviewInheritsCleanBaseMergeThatSplitsElidedGap(t *testing.T) {
+	// The unchanged text alone is over reviewDiffBudget, so the file is elided.
+	const head = "diff --git a/big.txt b/big.txt\nindex 1111111..2222222 100644\n--- a/big.txt\n+++ b/big.txt\n"
+	bigCtx := " " + strings.Repeat("c", reviewDiffBudget+1)
+	before := head + hunkBody(bigCtx, "+first", longCtx, "+second", longCtx)
+	after := "diff --git a/big.txt b/big.txt\nindex 3333333..4444444 100644\n--- a/big.txt\n+++ b/big.txt\n" +
+		hunkBody(bigCtx, "+first", longCtx, longCtx, longCtx) + hunkBody(longCtx, longCtx, longCtx, "+second", longCtx)
+	a, _ := summarizeLocalDiff(before, reviewDiffBudget)
+	b, _ := summarizeLocalDiff(after, reviewDiffBudget)
+	if reviewPatchID(a) == reviewPatchID(b) {
+		t.Fatal("the gap split did not change the patch id, so the inheritance below proves nothing")
+	}
+	s, g, runner, review, _ := reviewedAtADiffs(t, before, after)
+	g.parents2 = map[string][]string{shaB: {shaA, shaC}}
+	s.Runner = &mergeRunner{Runner: s.Runner, headTree: "tree-m", mergedTree: "tree-m"}
+	if e := review(Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if runner.calls != 1 || g.postCount != 1 || len(g.passes[shaB]) != 0 {
+		t.Fatalf("a clean base merge that split an elided gap was reviewed: calls=%d posts=%d", runner.calls, g.postCount)
+	}
+}

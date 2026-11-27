@@ -138,9 +138,14 @@ func TestInheritedPassesNeedMatchingReceipts(t *testing.T) {
 // diff is diffB, as if the base had been merged into it.
 func reviewedAtA(t *testing.T, diffB string) (*Service, *fakeGH, *fakeRunner, func(Options) error, string) {
 	t.Helper()
+	return reviewedAtADiffs(t, toolDiff("1111111..2222222", 1, "new"), diffB)
+}
+
+// reviewedAtADiffs is reviewedAtA with head A's diff given as well.
+func reviewedAtADiffs(t *testing.T, diffA, diffB string) (*Service, *fakeGH, *fakeRunner, func(Options) error, string) {
+	t.Helper()
 	s, g, _, _, r := reviewSetup(t)
 	runner := s.Runner.(*fakeRunner)
-	diffA := toolDiff("1111111..2222222", 1, "new")
 	g.diffs = map[string]string{shaA: diffA, shaB: diffB}
 	if e := s.Review(context.Background(), r, 7, "openai", Options{}); e != nil {
 		t.Fatal(e)
@@ -148,12 +153,14 @@ func reviewedAtA(t *testing.T, diffB string) (*Service, *fakeGH, *fakeRunner, fu
 	if g.postCount != 1 || runner.calls != 1 {
 		t.Fatalf("first head not reviewed: posts=%d calls=%d", g.postCount, runner.calls)
 	}
-	if got := g.passes[shaA][0].Patch; got != reviewPatchID(diffA) {
+	// The review covers the budget-bounded text, which elides an oversized file.
+	bounded, _ := boundDiff(diffA)
+	if got := g.passes[shaA][0].Patch; got != reviewPatchID(bounded) {
 		t.Fatalf("the pass did not record its patch id: %q", got)
 	}
 	g.pull.Head.SHA = shaB
 	g.pull.Base.SHA = shaC
-	return s, g, runner, func(o Options) error { return s.Review(context.Background(), r, 7, "openai", o) }, reviewPatchID(diffA)
+	return s, g, runner, func(o Options) error { return s.Review(context.Background(), r, 7, "openai", o) }, reviewPatchID(bounded)
 }
 
 func TestReviewInheritsEqualPatch(t *testing.T) {

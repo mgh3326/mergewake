@@ -303,24 +303,6 @@ func TestElidedPatchIDTracksChangedLine(t *testing.T) {
 // hunkFile is one modified file whose hunk holds lines (each starting with
 // ' ', '+', '-' or '\'); the hunk counts are derived from them.
 func hunkFile(name, index string, lines ...string) string {
-	return "diff --git a/" + name + " b/" + name + "\nindex " + index + " 100644\n--- a/" + name + "\n+++ b/" + name + "\n" +
-		hunkBody(lines...)
-}
-
-// longCtx is a context line long enough that a file holding a few of them is
-// elided under the test budget.
-var longCtx = " " + strings.Repeat("c", 200)
-
-// elidedWith puts one elided big file in front of a small file that stays.
-func elidedWith(big string) string {
-	small := "diff --git a/small.txt b/small.txt\nindex 3333333..4444444 100644\n--- a/small.txt\n+++ b/small.txt\n" +
-		"@@ -1,3 +1,3 @@\n keep\n-old\n+new\n end\n"
-	return big + small
-}
-
-// hunkBody is one "@@" hunk holding lines (each starting with ' ', '+', '-' or
-// '\'); the hunk counts are derived from them.
-func hunkBody(lines ...string) string {
 	oldN, newN := 0, 0
 	for _, l := range lines {
 		switch l[0] {
@@ -334,6 +316,7 @@ func hunkBody(lines ...string) string {
 		}
 	}
 	var b strings.Builder
+	b.WriteString("diff --git a/" + name + " b/" + name + "\nindex " + index + " 100644\n--- a/" + name + "\n+++ b/" + name + "\n")
 	b.WriteString("@@ -1," + itoa(oldN) + " +1," + itoa(newN) + " @@\n")
 	for _, l := range lines {
 		b.WriteString(l + "\n")
@@ -341,21 +324,32 @@ func hunkBody(lines ...string) string {
 	return b.String()
 }
 
-// Growing the unchanged gap between two added lines by five base lines splits
-// the hunk in two: the + and - lines are identical, so the patch id must hold.
-func TestElidedPatchIDIgnoresGapGrowthThatSplitsHunk(t *testing.T) {
+// longCtx is a context line long enough that a file holding a few of them is
+// elided under the test budget.
+var longCtx = " " + strings.Repeat("c", 200)
+
+// elidedWith puts one elided big file in front of a small file that stays.
+func elidedWith(big string) string {
+	small := "diff --git a/small.txt b/small.txt\nindex 3333333..4444444 100644\n--- a/small.txt\n+++ b/small.txt\n" +
+		"@@ -1,3 +1,3 @@\n keep\n-old\n+new\n end\n"
+	return big + small
+}
+
+// Moving an added line within an elided file's hunk moves the patch, so the
+// patch id must change even though the changed text is identical.
+func TestElidedPatchIDTracksChangePosition(t *testing.T) {
 	const budget = 400
-	head := "diff --git a/big.txt b/big.txt\nindex 1111111..2222222 100644\n--- a/big.txt\n+++ b/big.txt\n"
-	before := elidedWith(head + hunkBody(longCtx, "+first", longCtx, "+second", longCtx))
-	after := elidedWith(head + hunkBody(longCtx, "+first", longCtx, longCtx, longCtx) +
-		hunkBody(longCtx, longCtx, longCtx, "+second", longCtx))
+	before := elidedWith(hunkFile("big.txt", "1111111..2222222",
+		longCtx, longCtx, longCtx, "+authorize()", longCtx, longCtx, longCtx))
+	after := elidedWith(hunkFile("big.txt", "1111111..2222222",
+		longCtx, longCtx, longCtx, longCtx, "+authorize()", longCtx, longCtx))
 	a, sa := summarizeLocalDiff(before, budget)
 	b, sb := summarizeLocalDiff(after, budget)
 	if !slices.Contains(sa, "big.txt") || !slices.Contains(sb, "big.txt") {
 		t.Fatalf("big.txt was not elided: %v %v", sa, sb)
 	}
-	if ida, idb := reviewPatchID(a), reviewPatchID(b); ida == "" || ida != idb {
-		t.Fatalf("a base gap that split the hunk changed the patch id: %q != %q", ida, idb)
+	if reviewPatchID(a) == reviewPatchID(b) {
+		t.Fatal("an added line moved within an elided file kept the patch id")
 	}
 }
 
