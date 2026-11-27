@@ -1732,18 +1732,22 @@ func (w *reviewerSweep) removeUnrecorded(ctx context.Context, l reviewerLabel, c
 		w.removeLocal(ctx, l)
 		return
 	}
+	only, open := w.hostlessPending(l)
 	if hs != nil {
-		if hs.failed {
+		switch {
+		case hs.failed && !open:
 			// The host's scan already reported its error; nothing about it
 			// can be inspected or proven, so the label waits for a pass that
 			// reads the host.
 			return
-		}
-		if !hs.host.Local() && w.removeRemote(ctx, hs, l, w.remembered(l, hs)) == remoteStop {
+		case hs.failed:
+			// Open discovery still owes probes to other hosts, which a failed
+			// host does not block: its own removal waits for a pass that reads it.
+		case !hs.host.Local() && w.removeRemote(ctx, hs, l, w.remembered(l, hs)) == remoteStop:
 			return
 		}
 	}
-	if only, open := w.hostlessPending(l); c.host == "" || open {
+	if c.host == "" || open {
 		if !w.discoverUnrecorded(ctx, l, only) {
 			return
 		}
@@ -1761,12 +1765,15 @@ func (w *reviewerSweep) discoverUnrecorded(ctx context.Context, l reviewerLabel,
 		// Exactly one reachable host holds the checkout, and the only doubt is
 		// hosts that failed or have no work root: the checkout is removed there.
 		// The label stays pending for those hosts alone.
-		w.settleHostlessStream(l)
-		if w.removeRemote(ctx, found, l, "") == remoteStop {
-			return false
-		}
+		// The owed hosts are written before the removal, so they survive a
+		// removal that stops; the placeholder settles only when none are owed.
 		if len(uncertain) > 0 {
 			w.recordHostless(l, "pending-cleanup", hostsPendingReason(uncertain))
+		} else {
+			w.settleHostlessStream(l)
+		}
+		if w.removeRemote(ctx, found, l, "") == remoteStop {
+			return false
 		}
 	case blocked:
 		// A probe cap or an inspect error that is not a down host leaves the

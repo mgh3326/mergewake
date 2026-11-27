@@ -133,3 +133,88 @@ func TestReapReviewerHostlessProbesDoNotStarveLegacyPathProbes(t *testing.T) {
 		}
 	}
 }
+
+// When the found host's removal stops (here a pane still uses the checkout),
+// the host that is down is still owed its probe: the label's pending row names
+// it before the removal, so the next pass probes it.
+func TestReapReviewerHostlessOwedHostSurvivesAStoppedRemoval(t *testing.T) {
+	f := newReviewerFix(t, reap.Host{Name: "node-b", Machine: "node-b", WorkRoot: "/work-b"})
+	f.s.Config.Hosts[0].WorkRoot = "/work-a"
+	f.hub.moreNodes = []any{map[string]any{"machine_id": "node-b", "state": "connected", "agents": []any{}, "panes": []any{}, "panes_ok": true}}
+	label := reviewerLabelFor(92, 2*24*time.Hour)
+	pathA := "/work-a/" + label + reviewerCheckoutSuffix
+	pathB := "/work-b/" + label + reviewerCheckoutSuffix
+	f.hub.detached[pathA] = true
+	f.hub.inspectErr = map[string]string{pathB: "node_timeout"}
+	f.addPane("w9:p9", "scratch", pathA)
+	seedDecisionRows(t, f.s, testRepo.Name, map[string]any{"command": "reviewer-held", "value": map[string]any{"pr": 92, "label": label}})
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if removes := f.hub.ops("worktree.remove"); len(removes) != 0 {
+		t.Fatalf("pass 1 removed a checkout in use: %v", removes)
+	}
+	wantPending := reviewerHostsPendingPrefix + "node-b" + reviewerHostsPendingSuffix
+	found := false
+	for _, row := range f.rows(t) {
+		if row.Host == "" && row.Reason == wantPending {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no pending row names node-b; rows %v", rowSummary(f.rows(t)))
+	}
+	// Discovery waits for the found host's removal (it may still hold the
+	// checkout), so the pane is released first; then the owed probe runs.
+	keep := []any{}
+	for _, p := range f.hub.agents["panes"].([]any) {
+		if p.(map[string]any)["pane_id"] != "w9:p9" {
+			keep = append(keep, p)
+		}
+	}
+	f.hub.agents["panes"] = keep
+	f.hub.agents["agents"] = keep
+	before := len(f.hub.ops("worktree.inspect"))
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range f.hub.ops("worktree.inspect")[before:] {
+		if p["cwd"] == pathB {
+			return
+		}
+	}
+	t.Fatalf("pass 2 did not probe node-b; rows %v", rowSummary(f.rows(t)))
+}
+
+// A host whose scan fails this pass does not block the probes still owed to
+// other hosts: the next pass probes the recovered host even though the found
+// host is down.
+func TestReapReviewerHostlessFailedFoundHostDoesNotBlockOwedProbe(t *testing.T) {
+	f := newReviewerFix(t, reap.Host{Name: "node-b", Machine: "node-b", WorkRoot: "/work-b"})
+	f.s.Config.Hosts[0].WorkRoot = "/work-a"
+	f.hub.moreNodes = []any{map[string]any{"machine_id": "node-b", "state": "connected", "agents": []any{}, "panes": []any{}, "panes_ok": true}}
+	label := reviewerLabelFor(93, 2*24*time.Hour)
+	pathA := "/work-a/" + label + reviewerCheckoutSuffix
+	pathB := "/work-b/" + label + reviewerCheckoutSuffix
+	f.hub.detached[pathA] = true
+	f.hub.inspectErr = map[string]string{pathB: "node_timeout"}
+	seedDecisionRows(t, f.s, testRepo.Name, map[string]any{"command": "reviewer-held", "value": map[string]any{"pr": 93, "label": label}})
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if removes := f.hub.ops("worktree.remove"); len(removes) != 1 || removes[0]["cwd"] != pathA {
+		t.Fatalf("pass 1 removes %v; rows %v", removes, rowSummary(f.rows(t)))
+	}
+	// Pass 2: node-a's scan fails (a pane's inspect times out) and node-b recovers.
+	f.addPane("w9:p9", "scratch", "/scratch-x")
+	f.hub.inspectErr = map[string]string{"/scratch-x": "node_timeout"}
+	before := len(f.hub.ops("worktree.inspect"))
+	// node-a's failed scan is reported as the pass's error; that is expected.
+	_ = f.reap(t, 0, Options{})
+	for _, p := range f.hub.ops("worktree.inspect")[before:] {
+		if p["cwd"] == pathB {
+			return
+		}
+	}
+	t.Fatalf("pass 2 did not probe node-b while node-a failed; rows %v", rowSummary(f.rows(t)))
+}
