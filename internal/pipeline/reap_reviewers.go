@@ -1832,7 +1832,17 @@ func (w *reviewerSweep) discoverUnrecorded(ctx context.Context, l reviewerLabel,
 		// ambiguous has a host that still cannot answer: which copy is the
 		// spawn's is not known, so nothing is removed. The label stays pending
 		// and names the hosts holding a copy and the named hosts still unanswered.
-		w.recordSeveral(l, w.ambiguousNames(prior, copies, uncertain), len(unreached) > 0)
+		names := w.ambiguousNames(prior, copies, uncertain)
+		switch {
+		case len(unreached) > 0:
+			w.recordSeveral(l, names, true)
+		case blocked:
+			// Only probe caps hold the label: a cap is not a failed host, so it
+			// neither settles the label nor starts the bound.
+			w.recordCapHeld(l, names)
+		default:
+			w.recordSeveral(l, names, false)
+		}
 	case found != nil && !blocked:
 		// Exactly one reachable host holds the checkout, and the only doubt is
 		// hosts that failed or have no work root: the checkout is removed there.
@@ -1904,10 +1914,29 @@ func (w *reviewerSweep) hostlessBound(l reviewerLabel, unanswered bool) time.Tim
 	if !unanswered {
 		return l.started
 	}
-	if v, ok := w.streams[l.name][reviewerStream(reapReceipt{Worktree: l.name})]; ok && !reviewerTerminal(v) && !v.FailedSince.IsZero() {
-		return v.FailedSince
+	if since := w.carriedSince(l); !since.IsZero() {
+		return since
 	}
 	return w.now
+}
+
+// carriedSince is the FailedSince of the label's open host-less row: the bound
+// a failed pass already started, zero when none is running.
+func (w *reviewerSweep) carriedSince(l reviewerLabel) time.Time {
+	if v, ok := w.streams[l.name][reviewerStream(reapReceipt{Worktree: l.name})]; ok && !reviewerTerminal(v) {
+		return v.FailedSince
+	}
+	return time.Time{}
+}
+
+// recordCapHeld writes the pending row of an ambiguous host-less label whose
+// only doubt is a probe cap. The row keeps the bound a failed pass started, if
+// one is running, and never settles the label.
+func (w *reviewerSweep) recordCapHeld(l reviewerLabel, hosts []string) {
+	rec := w.row(l)
+	rec.Worktree = l.name
+	rec.FailedSince = w.carriedSince(l)
+	w.record(rec, "pending-cleanup", reviewerHostsSeveralPrefix+strings.Join(hosts, ", "))
 }
 
 // recordOpen writes the pending row of a host-less label whose unanswered hosts
