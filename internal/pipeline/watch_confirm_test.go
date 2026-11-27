@@ -200,3 +200,60 @@ func TestWatchHeadCulpritMarkerSettlement(t *testing.T) {
 		}
 	})
 }
+
+func TestWatchConfirmedCulpritNotReheldByMixedResult(t *testing.T) {
+	s, g, _, out, now, r := headCulpritChain(t)
+	g.blocking = true
+	if e := s.Watch(context.Background(), r, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	// The window expires; the pass confirms the culprit, then a transient error
+	// stops it before any incident is saved.
+	*now = now.Add(31 * time.Minute)
+	g.pullErr = errors.New("transient")
+	if e := s.Watch(context.Background(), r, Options{}); e == nil {
+		t.Fatal("expected the transient error to surface")
+	}
+	// The rerun now posts a passing status beside the head's failed check run.
+	g.pullErr = nil
+	g.checkNames = map[string]map[string]github.CI{shaB: {"CI": github.Red}}
+	g.statuses = map[[2]string]statusRecord{{shaB, "CI"}: {github.Green, *now}}
+	*now = now.Add(time.Minute)
+	out.Reset()
+	_ = s.Watch(context.Background(), r, Options{})
+	if strings.Contains(out.String(), "mixed result") {
+		t.Fatalf("confirmed culprit re-held as mixed: %s", out.String())
+	}
+	m, found, e := (&watchStream{Service: s}).readRedSeen(r.Name)
+	if e != nil || !found || !m.Confirmed || m.Culprit != shaB {
+		t.Fatalf("confirmation lost: %+v found=%v err=%v", m, found, e)
+	}
+}
+
+func TestWatchGreenGrandparentKeepsMarker(t *testing.T) {
+	s, g, _, out, _, r := headCulpritChain(t)
+	g.blocking = true
+	// Culprit C sits on top of B, which sits on green A. C is the head.
+	g.pull.MergeCommitSHA = shaC
+	g.head = shaC
+	g.parents = map[string]string{shaC: shaB, shaB: shaA}
+	g.checks = map[string]github.CI{shaC: github.Red, shaB: github.Green, shaA: github.Green}
+	if e := s.Watch(context.Background(), r, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	// The deploy walk-back lands two commits below the culprit while B is still
+	// pending: the green head is a grandparent, not the direct parent.
+	g.head = shaA
+	g.checks = map[string]github.CI{shaA: github.Green, shaB: github.Pending, shaC: github.Red}
+	out.Reset()
+	if e := s.Watch(context.Background(), r, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	if strings.Contains(out.String(), "flaky") {
+		t.Fatalf("grandparent reported flaky: %s", out.String())
+	}
+	m, found, e := (&watchStream{Service: s}).readRedSeen(r.Name)
+	if e != nil || !found || m.Culprit != shaC {
+		t.Fatalf("grandparent dropped the marker: %+v found=%v err=%v", m, found, e)
+	}
+}

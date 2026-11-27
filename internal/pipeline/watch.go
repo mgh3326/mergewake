@@ -227,7 +227,9 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 			if re != nil {
 				return re
 			}
-			if found && m.Culprit == head {
+			// A confirmed culprit is no longer held: its pass fails as it did
+			// before the window, and the mixed hold does not repeat over it.
+			if found && m.Culprit == head && !m.Confirmed {
 				result.Action = "hold"
 				result.Reason = "mixed result: a passing rerun status sits beside the red check run; held, not reverted"
 				return s.reportWatch(ctx, r, result, head+":mixed", o)
@@ -992,9 +994,9 @@ func (s *watchStream) confirmHeadRed(r config.Repo, culprit string, headCulprit 
 // reason, naming no PR and reverting nothing, and clear the marker only after
 // the notice is out. A green descendant of the marked culprit (a fix forward,
 // or a manual revert) clears the marker and takes the healthy path. A green
-// ancestor of the culprit (the deploy stream's walk-back while a rerun runs)
-// keeps the marker and takes the healthy path. Returns true when the pass is
-// settled here.
+// ancestor of the culprit on its first-parent walk (the deploy stream's
+// walk-back while a rerun runs) keeps the marker and takes the healthy path.
+// Returns true when the pass is settled here.
 func (s *watchStream) settleGreenHead(ctx context.Context, r config.Repo, head string, window time.Duration, result *watchResult, o Options) (bool, error) {
 	m, found, e := s.readRedSeen(r.Name)
 	if e != nil || !found {
@@ -1009,13 +1011,34 @@ func (s *watchStream) settleGreenHead(ctx context.Context, r config.Repo, head s
 		return true, s.clearRedSeen(r.Name)
 	}
 	if m.Culprit != head {
-		parent, e := s.GH.Commit(ctx, r.Name, m.Culprit)
+		ancestor, e := s.firstParentAncestor(ctx, r, head, m.Culprit)
 		if e != nil {
 			return false, e
 		}
-		if len(parent.Parents) > 0 && parent.Parents[0].SHA == head {
+		if ancestor {
 			return false, nil
 		}
 	}
 	return false, s.clearRedSeen(r.Name)
+}
+
+// firstParentAncestor reports whether ancestor is on the first-parent walk from
+// descendant. The walk stops at watch_limit steps, the same bound the bisect
+// walk uses, so a long history costs a bounded number of reads.
+func (s *watchStream) firstParentAncestor(ctx context.Context, r config.Repo, ancestor, descendant string) (bool, error) {
+	cur := descendant
+	for i := 0; i < s.Config.WatchLimit; i++ {
+		c, e := s.GH.Commit(ctx, r.Name, cur)
+		if e != nil {
+			return false, e
+		}
+		if len(c.Parents) == 0 {
+			return false, nil
+		}
+		cur = c.Parents[0].SHA
+		if cur == ancestor {
+			return true, nil
+		}
+	}
+	return false, nil
 }
