@@ -77,6 +77,12 @@ func baseDropRepo(t *testing.T, mode string) (root, base, head string) {
 		if err := os.WriteFile(filepath.Join(src, ":(literal)notes.txt"), []byte("base path line\n"), 0600); err != nil {
 			t.Fatal(err)
 		}
+	} else if mode == "long_blame" {
+		// 20000 short lines: the per-line blame header form exceeds the
+		// runner bound while the once-per-commit form fits.
+		if err := os.WriteFile(filepath.Join(src, "big.txt"), []byte(strings.Repeat("x\n", 20000)), 0600); err != nil {
+			t.Fatal(err)
+		}
 	} else if mode == "large" {
 		if err := os.WriteFile(filepath.Join(src, "large.txt"), []byte(strings.Repeat("z", (4<<20)+1024)+"\n"), 0600); err != nil {
 			t.Fatal(err)
@@ -91,7 +97,7 @@ func baseDropRepo(t *testing.T, mode string) (root, base, head string) {
 	switch mode {
 	case "drop":
 		baseDropGit(t, src, "merge", "--no-ff", "-s", "ours", "main", "-m", "drop base addition")
-	case "duplicate", "doubleplus", "paths", "literal_path", "large":
+	case "duplicate", "doubleplus", "paths", "literal_path", "long_blame", "large":
 		baseDropGit(t, src, "merge", "--no-ff", "-s", "ours", "main", "-m", "drop base addition")
 	case "duplicate_other_occurrence":
 		write("func A() {\n}\nfunc B() {\nreturn errors.New(\"x\")\n}\n")
@@ -220,7 +226,7 @@ func TestGateBaseChangeDroppedUnknownFailsClosed(t *testing.T) {
 	if rows := auditRows(t, s, r, "pr-notify"); len(rows) != 1 || !strings.Contains(fmt.Sprint(rows[0]["base_drop_error"]), "transient fetch failure") {
 		t.Fatalf("base-drop error was not audited: %v", rows)
 	}
-	if reasons, waiting := splitInternalWaits([]string{"base_change_dropped:unknown"}, ""); !waiting || len(reasons) != 0 {
+	if reasons, waiting := splitInternalWaits([]string{"base_drop_unverified:fetch"}, ""); !waiting || len(reasons) != 0 {
 		t.Fatalf("verification fault was not an internal wait: reasons=%v waiting=%v", reasons, waiting)
 	}
 }
@@ -505,9 +511,62 @@ func TestBaseDropStallRunsAlongsideOtherHold(t *testing.T) {
 }
 
 func TestBaseDropUnknownIsAuditedInternalWait(t *testing.T) {
-	reasons, waiting := splitInternalWaits([]string{"base_change_dropped:unknown"}, "")
-	if !waiting || len(reasons) != 0 || authorAction("base_change_dropped:unknown") {
+	reasons, waiting := splitInternalWaits([]string{"base_drop_unverified:fetch"}, "")
+	if !waiting || len(reasons) != 0 || authorAction("base_drop_unverified:fetch") {
 		t.Fatalf("unknown wait reasons=%v waiting=%v", reasons, waiting)
+	}
+}
+
+func TestBaseDropVerifiesFileWhoseLineBlameExceedsLimit(t *testing.T) {
+	root, base, head := baseDropRepo(t, "long_blame")
+	// The fixture straddles the runner bound: the per-line header form
+	// overflows it, the once-per-commit form fits.
+	lineForm, err := exec.Command("git", "-C", root, "blame", "--root", "--line-porcelain", base, "--", "big.txt").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	commitForm, err := exec.Command("git", "-C", root, "blame", "--root", "--porcelain", base, "--", "big.txt").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(lineForm) < 4<<20 || len(commitForm) >= 4<<20 {
+		t.Fatalf("fixture sizes line-porcelain=%d porcelain=%d do not straddle the limit", len(lineForm), len(commitForm))
+	}
+	got, err := baseDropCheckErr(t, root, base, head)
+	if err != nil {
+		t.Fatalf("large file did not verify: %v", err)
+	}
+	if !slices.Equal(got, []string{base}) {
+		t.Fatalf("dropped commits = %v, want [%s]", got, base)
+	}
+}
+
+func TestGateBaseDropVerificationErrorIsUnverifiedReason(t *testing.T) {
+	root, base, head := baseDropRepo(t, "drop")
+	s, g, _, _, r := setup(t)
+	r.Root = root
+	s.Runner = gitErrRunner{Runner: &realGitRunner{fakeRunner: *s.Runner.(*fakeRunner)}, fails: func(args []string) bool {
+		return slices.Contains(args, "fetch")
+	}, err: errors.New("transient fetch failure")}
+	g.pull.Base = github.Ref{Ref: "main", SHA: base}
+	g.pull.Head = github.Ref{Ref: "feature", SHA: head}
+	g.pull.Head.Repo.FullName = r.Name
+	g.pull.ChangedFiles = 1
+	p, err := s.Policy(context.Background(), r, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := s.mergeGate(context.Background(), r, g.pull, p, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(v.Reasons, "base_drop_unverified:fetch") {
+		t.Fatalf("verification error reasons = %v, want base_drop_unverified:fetch", v.Reasons)
+	}
+	for _, reason := range v.Reasons {
+		if strings.HasPrefix(reason, "base_change_dropped:") {
+			t.Fatalf("verification error reported as a dropped change: %v", v.Reasons)
+		}
 	}
 }
 

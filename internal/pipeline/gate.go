@@ -23,7 +23,7 @@ import (
 // gateVerdict is the merge-gate outcome for one PR head. State is "ready",
 // "blocked" or "pending"; pending verdicts emit nothing and never merge.
 // Reasons use a closed vocabulary: check_failed:<name>, check_cancelled:<name>, check_absent:<name> (a required check
-// with no run or status on the head, once the head has had time to start it), base_change_dropped:<n>, base_change_dropped:unknown, threads_open:<n>,
+// with no run or status on the head, once the head has had time to start it), base_change_dropped:<n>, base_drop_unverified:<cause> (the base-drop check could not run), threads_open:<n>,
 // blocking_findings:<n>, triage_unanswered:<n>, finding_outside_diff:<n> (critical or high findings a pass listed in its review body because their
 // path or line is not in the diff), author_fixing, review_missing and conflict. The two graded reasons replace threads_open when the policy has a
 // review_gate.land: graded or the PR takes the fast lane.
@@ -561,7 +561,7 @@ func (s *Service) mergeGateResult(ctx context.Context, r config.Repo, pr github.
 		if s.Log != nil {
 			s.Log.Warn("base-drop verification failed", "repo", r.Name, "pr", pr.Number, "head", pr.Head.SHA, "error", v.BaseDropError)
 		}
-		v.Reasons = append(v.Reasons, "base_change_dropped:unknown")
+		v.Reasons = append(v.Reasons, baseDropUnverifiedReason(dropErr))
 	} else if len(dropped) > 0 {
 		v.BaseChangesDropped = dropped
 		v.Reasons = append(v.Reasons, "base_change_dropped:"+strconv.Itoa(len(dropped)))

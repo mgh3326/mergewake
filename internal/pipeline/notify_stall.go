@@ -220,7 +220,7 @@ const reviewStallAfter = 60 * time.Minute
 // author's to fix or needs a human decision, and is sent.
 func splitInternalWaits(reasons []string, block string) (acted []string, waiting bool) {
 	for _, reason := range reasons {
-		if reason == "base_change_dropped:unknown" {
+		if strings.HasPrefix(reason, baseDropUnverifiedPrefix) {
 			waiting = true
 			continue
 		}

@@ -120,7 +120,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 	}
 	var baseDropSince time.Time
 	if o.Reporting() {
-		if slices.Contains(v.Reasons, "base_change_dropped:unknown") {
+		if unverifiedBaseDrop(v.Reasons) != "" {
 			baseDropSince, e = s.baseDropWaitSince(r, pr)
 		} else {
 			e = s.clearBaseDropWait(r, pr)
@@ -188,7 +188,7 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 		conflicted = slices.Contains(reasons, "conflict")
 		reasons = slices.DeleteFunc(slices.Clone(reasons), func(reason string) bool { return reason == "conflict" })
 		if waiting {
-			if slices.Contains(v.Reasons, "base_change_dropped:unknown") {
+			if unverifiedBaseDrop(v.Reasons) != "" {
 				lane, via, sent, e := s.baseDropStalled(ctx, r, pr, v.BaseDropError, baseDropSince)
 				if e != nil {
 					if !errors.Is(e, errNotifyDelivery) {
@@ -198,11 +198,11 @@ func (s *Service) NotifyPR(ctx context.Context, r config.Repo, n int, o Options)
 					return s.audit(r.Name, "pr-notify", record, false)
 				}
 				if sent {
-					record.Reasons, record.Lane, record.Via, record.Sent = []string{"base_change_dropped:unknown"}, lane, via, true
+					record.Reasons, record.Lane, record.Via, record.Sent = []string{unverifiedBaseDrop(v.Reasons)}, lane, via, true
 				}
 			}
 			if len(reasons) == 0 && !conflicted {
-				if slices.Contains(v.Reasons, "base_change_dropped:unknown") {
+				if unverifiedBaseDrop(v.Reasons) != "" {
 					return s.audit(r.Name, "pr-notify", record, false)
 				}
 				since, e := s.reviewWaitSince(r, pr)
@@ -899,7 +899,7 @@ func (s *Service) notifyLane(ctx context.Context, r config.Repo, pr github.Pull)
 // detail only the author can add (NotifyPR renders it "review_missing (detail)").
 func authorAction(summary string) bool {
 	for _, reason := range strings.Split(summary, "; ") {
-		if reason == "base_change_dropped:unknown" {
+		if strings.HasPrefix(reason, baseDropUnverifiedPrefix) {
 			continue
 		}
 		if reason == "conflict" || strings.HasPrefix(reason, "review_missing (") {
