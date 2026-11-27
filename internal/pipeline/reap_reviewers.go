@@ -910,8 +910,11 @@ func (w *reviewerSweep) candidates(lastCleanup map[string]reapReceipt, prNum int
 			bare = append(bare, label)
 			continue
 		}
-		if w.finishedLabel(label, lastCleanup) && !w.oldPathRetry(label, w.labelHost[label]) && !w.absentDue(label) {
-			continue
+		if w.finishedLabel(label, lastCleanup) && !w.oldPathRetry(label, w.labelHost[label]) {
+			// A label whose absent answer is due is visited again (hk 6992).
+			if !w.absentDue(label) {
+				continue
+			}
 		}
 		if l, ok := keep(label); ok {
 			cands = append(cands, reviewerCandidate{label: l, host: w.labelHost[label]})
