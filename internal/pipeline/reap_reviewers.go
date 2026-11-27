@@ -581,7 +581,30 @@ func (w *reviewerSweep) collect(receipts []reapReceipt) map[string]reapReceipt {
 			w.rememberHost(label, rec.Host)
 		}
 	}
+	// A job host the configuration does not hold keeps the label's host while
+	// its row is open. A discovery row for another host is newer, but it must
+	// not replace that host, or its worktree is never targeted once it is
+	// configured again (hk 7000).
+	for label, streams := range w.streams {
+		if host := unconfiguredJobHost(streams); host != "" {
+			w.labelHost[label] = w.hostName(host)
+		}
+	}
 	return lastCleanup
+}
+
+// unconfiguredJobHost names the host of a label's open job-host-unconfigured
+// row, the newest such row: the job host no configured host answered for. ""
+// when no stream of the label holds one.
+func unconfiguredJobHost(streams map[string]reapReceipt) string {
+	host := ""
+	var at time.Time
+	for _, v := range streams {
+		if v.Result == "kept" && v.Reason == "job-host-unconfigured" && v.Host != "" && (host == "" || v.Time.After(at)) {
+			host, at = v.Host, v.Time
+		}
+	}
+	return host
 }
 
 // initDrain bounds the pass's guarded removals per host and fixes the order
@@ -813,8 +836,18 @@ func (w *reviewerSweep) candidates(lastCleanup map[string]reapReceipt, prNum int
 	for label := range lastCleanup {
 		labels[label] = true
 	}
+	// A bare-unknown label is queued after the journal merge below, once that
+	// merge has named its host for this pass if a journal row did (hk 6999).
+	var bare []string
 	for label := range labels {
-		if paned[label] || (w.finishedLabel(label, lastCleanup) && !w.oldPathRetry(label, w.labelHost[label]) && !w.bareUnknown(label)) {
+		if paned[label] {
+			continue
+		}
+		if w.bareUnknown(label) {
+			bare = append(bare, label)
+			continue
+		}
+		if w.finishedLabel(label, lastCleanup) && !w.oldPathRetry(label, w.labelHost[label]) {
 			continue
 		}
 		if l, ok := keep(label); ok {
@@ -860,6 +893,12 @@ func (w *reviewerSweep) candidates(lastCleanup map[string]reapReceipt, prNum int
 			// row named one, so it is a candidate again.
 			cands = append(cands, reviewerCandidate{label: l, host: host})
 			labelCandidate[name] = true
+		}
+	}
+	for _, label := range bare {
+		if l, ok := keep(label); ok && !labelCandidate[label] {
+			cands = append(cands, reviewerCandidate{label: l, host: w.labelHost[label]})
+			labelCandidate[label] = true
 		}
 	}
 	sort.SliceStable(cands, func(i, j int) bool {
@@ -1826,22 +1865,32 @@ func (w *reviewerSweep) removeUnrecorded(ctx context.Context, l reviewerLabel, c
 func (w *reviewerSweep) discoverUnrecorded(ctx context.Context, l reviewerLabel, only map[string]bool) bool {
 	prior := w.ambiguousCopies(l)
 	found, uncertain, blocked, capped, copies, unreached := w.findUnrecordedCheckout(ctx, l, only)
+	ambiguous := len(copies) > 1 || (len(prior) > 0 && (len(uncertain) > 0 || blocked))
+	names := w.ambiguousNames(prior, copies, uncertain)
 	switch {
-	case len(copies) > 1 || (len(prior) > 0 && (len(uncertain) > 0 || blocked)):
+	case ambiguous && len(names) > 0:
 		// Two or more reachable hosts hold a checkout, or a label that was
 		// ambiguous has a host that still cannot answer: which copy is the
 		// spawn's is not known, so nothing is removed. The label stays pending
 		// and names the hosts holding a copy and the named hosts still unanswered.
-		names := w.ambiguousNames(prior, copies, uncertain)
 		switch {
 		case len(unreached) > 0:
 			w.recordSeveral(l, names, true)
 		case blocked:
 			// Only probe caps hold the label: a cap is not a failed host, so it
 			// neither settles the label nor starts the bound.
-			w.recordCapHeld(l, names)
+			w.recordCapHeld(l, reviewerHostsSeveralPrefix+strings.Join(names, ", "))
 		default:
 			w.recordSeveral(l, names, false)
+		}
+	case ambiguous:
+		// No copy is seen and no named host is left to report, so only the hosts
+		// that could not answer remain: they are the owed hosts. A row never
+		// names an empty list (hk 6998).
+		if len(unreached) > 0 {
+			w.recordUncertain(l, uncertain)
+		} else {
+			w.recordCapHeld(l, hostsPendingReason(uncertain))
 		}
 	case found != nil && !blocked:
 		// Exactly one reachable host holds the checkout, and the only doubt is
@@ -1864,17 +1913,9 @@ func (w *reviewerSweep) discoverUnrecorded(ctx context.Context, l reviewerLabel,
 		if capped != "" {
 			reason = fmt.Sprintf(reviewerHostProbeHold, capped)
 		}
-		w.recordHostless(l, "pending-cleanup", reason)
+		w.recordCapHeld(l, reason)
 	case len(uncertain) > 0:
-		// Only failed hosts or hosts without a work root remain unanswered.
-		// Once they have failed past reviewerHostlessMaxAge, the label settles
-		// with the hosts that were never probed named in its reason.
-		since := w.hostlessBound(l, true)
-		if since.Add(reviewerHostlessMaxAge).Before(w.now) {
-			w.recordHostless(l, "kept", reviewerHostUnknown+reviewerHostUnprobed+strings.Join(uncertain, ", "))
-		} else {
-			w.recordOpen(l, hostsPendingReason(uncertain), since)
-		}
+		w.recordUncertain(l, uncertain)
 	default:
 		// Nothing holds the checkout and no host is left to ask: the label
 		// ends with its terminal row. A dry run leaves it pending.
@@ -1929,14 +1970,27 @@ func (w *reviewerSweep) carriedSince(l reviewerLabel) time.Time {
 	return time.Time{}
 }
 
-// recordCapHeld writes the pending row of an ambiguous host-less label whose
-// only doubt is a probe cap. The row keeps the bound a failed pass started, if
-// one is running, and never settles the label.
-func (w *reviewerSweep) recordCapHeld(l reviewerLabel, hosts []string) {
+// recordCapHeld writes the pending row of a host-less label that a probe cap or
+// an inspect error that is not a down host holds. The row keeps the bound a
+// failed pass started, if one is running (hk 7001), and never settles the label.
+func (w *reviewerSweep) recordCapHeld(l reviewerLabel, reason string) {
 	rec := w.row(l)
 	rec.Worktree = l.name
 	rec.FailedSince = w.carriedSince(l)
-	w.record(rec, "pending-cleanup", reviewerHostsSeveralPrefix+strings.Join(hosts, ", "))
+	w.record(rec, "pending-cleanup", reason)
+}
+
+// recordUncertain writes the row of a host-less label that only hosts which
+// could not answer still owe. The label stays pending naming them; once they
+// have failed past reviewerHostlessMaxAge from the first failed pass, it
+// settles with them named as never probed.
+func (w *reviewerSweep) recordUncertain(l reviewerLabel, hosts []string) {
+	since := w.hostlessBound(l, true)
+	if since.Add(reviewerHostlessMaxAge).Before(w.now) {
+		w.recordHostless(l, "kept", reviewerHostUnknown+reviewerHostUnprobed+strings.Join(hosts, ", "))
+		return
+	}
+	w.recordOpen(l, hostsPendingReason(hosts), since)
 }
 
 // recordOpen writes the pending row of a host-less label whose unanswered hosts
@@ -1974,7 +2028,14 @@ func (w *reviewerSweep) ambiguousCopies(l reviewerLabel) []string {
 	if !ok {
 		return nil
 	}
-	return strings.Split(rest, ", ")
+	// An empty tail names no host (hk 6998): it is not an ambiguous label.
+	var names []string
+	for _, n := range strings.Split(rest, ", ") {
+		if n != "" {
+			names = append(names, n)
+		}
+	}
+	return names
 }
 
 // ambiguousNames are the names an ambiguous host-less label keeps: the hosts
