@@ -633,7 +633,10 @@ func (w *reviewerSweep) collect(receipts []reapReceipt) map[string]reapReceipt {
 	for label, streams := range w.streams {
 		if host := unconfiguredJobHost(streams); host != "" {
 			w.labelHost[label] = w.hostName(host)
-			if owed := w.owedConfiguredHost(streams); owed != "" {
+			// The yield to an owed configured host holds only while the pinned
+			// host is still unconfigured: once it is configured again, its open
+			// row keeps the label, so its checkout is the one removed (hk 7000).
+			if owed := w.owedConfiguredHost(streams); owed != "" && w.scannedHost(w.hostName(host)) == nil {
 				w.labelHost[label] = owed
 			}
 		}
@@ -656,14 +659,17 @@ func unconfiguredJobHost(streams map[string]reapReceipt) string {
 }
 
 // owedConfiguredHost names the configured host of a label's newest open
-// worktree row: a checkout the sweep still owes a removal on that host. ""
-// when no stream of the label holds one on a configured host.
+// worktree row: a checkout the sweep still owes a removal on that host. Only a
+// remote host that scanned readable this pass qualifies; a failed host or the
+// local host owes nothing the remote visit could reach (hk 7018). "" when no
+// stream of the label holds one on such a host.
 func (w *reviewerSweep) owedConfiguredHost(streams map[string]reapReceipt) string {
 	host := ""
 	var at time.Time
 	for _, v := range streams {
 		name := w.hostName(v.Host)
-		if v.Worktree == "" || reviewerTerminal(v) || reviewerCheckoutRemoved(v) || w.scannedHost(name) == nil {
+		hs := w.scannedHost(name)
+		if v.Worktree == "" || reviewerTerminal(v) || reviewerCheckoutRemoved(v) || hs == nil || hs.failed || hs.host.Local() {
 			continue
 		}
 		if host == "" || v.Time.After(at) || (v.Time.Equal(at) && name < host) {
@@ -1287,6 +1293,9 @@ func (w *reviewerSweep) visit(ctx context.Context, c reviewerCandidate) {
 		case hs == nil:
 			gate.Host = job.Host
 			w.record(gate, "kept", "job-host-unconfigured")
+			// The record's host is not configured, but the label's owed
+			// checkout on a healthy configured host is still reached (hk 7018).
+			w.removeOwedHost(ctx, l, c.host)
 			return
 		case hs.failed:
 			// The host's scan already reported its error.
@@ -1972,6 +1981,17 @@ func (w *reviewerSweep) removeUnrecorded(ctx context.Context, l reviewerLabel, c
 		}
 	}
 	w.removeLocal(ctx, l)
+}
+
+// removeOwedHost runs the guarded removal of a label's checkout on host, the
+// configured host the candidate names, when that host is a remote one that
+// scanned readable this pass. Any other host owes no remote removal here.
+func (w *reviewerSweep) removeOwedHost(ctx context.Context, l reviewerLabel, host string) {
+	hs := w.scannedHost(host)
+	if hs == nil || hs.failed || hs.host.Local() {
+		return
+	}
+	w.removeRemote(ctx, hs, l, w.remembered(l, hs))
 }
 
 // discoverUnrecorded searches the configured work roots for the checkout of a
