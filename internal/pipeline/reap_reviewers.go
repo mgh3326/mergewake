@@ -2541,15 +2541,15 @@ func reviewerNoRefetch(v reapReceipt) bool {
 	return v.Action == "reviewer-cleanup" && reviewerSweepHold(v.Reason)
 }
 
-// reviewerSweepHold reports whether a pending reason is one of the reviewer
-// sweep's holds: a bounded step the next pass takes. Every reason the sweep
-// writes as a hold is named here, so a new hold is added in one place and
-// never queues a refetch (hk 6993).
+// reviewerSweepHold reports whether a pending reason on a reviewer-cleanup row
+// is one of the sweep's probe or host holds: a bounded step the next pass
+// takes. The drain and budget holds are written on reviewer-reap rows, which
+// reviewerNoRefetch already exempts, so they are not named here. A
+// reviewer-cleanup row holding a budget cut (closeReviewerPane) still refetches
+// its PR (hk 6987).
 func reviewerSweepHold(reason string) bool {
 	switch {
 	case reason == reviewerLegacyProbeHold,
-		reason == reviewerDrainHold,
-		reason == reviewerBudgetHold,
 		strings.HasPrefix(reason, "host checkout probe cap reached at "),
 		strings.HasPrefix(reason, reviewerHostsPendingPrefix),
 		strings.HasPrefix(reason, reviewerHostsSeveralPrefix):

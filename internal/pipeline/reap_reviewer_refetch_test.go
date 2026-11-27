@@ -31,10 +31,11 @@ func (g *pullLog) fetched(pr int) bool {
 	return false
 }
 
-// Hold rows of the reviewer sweep (probe-cap holds, unresolved host checkouts,
-// drain and budget holds; hk 6864, hk 6993) never queue a GitHub Pull, whatever
-// their PR's state, and neither does a reviewer-reap row: the sweep covers its
-// own rows.
+// Hold rows of the reviewer sweep (probe-cap holds and unresolved host
+// checkouts; hk 6864) never queue a GitHub Pull, whatever their PR's state, and
+// neither does a reviewer-reap row: the sweep covers its own rows, its drain and
+// budget holds included (hk 6993). The sweep writes those two holds on
+// reviewer-reap rows, as production does.
 func TestReapReviewerHeldRowsDoNotRefetchTheirPRs(t *testing.T) {
 	gh := &pullLog{}
 	r := &scriptRunner{outs: worktreeOuts("/repo")}
@@ -44,14 +45,20 @@ func TestReapReviewerHeldRowsDoNotRefetchTheirPRs(t *testing.T) {
 		fmt.Sprintf(reviewerHostProbeHold, "node-b"),
 		reviewerHostsPendingPrefix + "node-a",
 		reviewerHostsSeveralPrefix + "node-a, node-b",
-		reviewerDrainHold,
-		reviewerBudgetHold,
 	}
 	var rows []reapReceipt
 	for i, reason := range holds {
 		pr := 90 + i
 		label := fmt.Sprintf("rv-%d", pr)
 		rows = append(rows, reapReceipt{Action: "reviewer-cleanup", Repo: testRepo.Name, PR: pr,
+			Host: "node-a", Label: label, Worktree: "/work/" + label + reviewerCheckoutSuffix,
+			Result: "pending-cleanup", Reason: reason,
+			Time: time.Now().Add(-25 * time.Hour).UTC()})
+	}
+	for i, reason := range []string{reviewerDrainHold, reviewerBudgetHold} {
+		pr := 94 + i
+		label := fmt.Sprintf("rv-%d", pr)
+		rows = append(rows, reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: pr,
 			Host: "node-a", Label: label, Worktree: "/work/" + label + reviewerCheckoutSuffix,
 			Result: "pending-cleanup", Reason: reason,
 			Time: time.Now().Add(-25 * time.Hour).UTC()})
@@ -67,6 +74,12 @@ func TestReapReviewerHeldRowsDoNotRefetchTheirPRs(t *testing.T) {
 	rows = append(rows, reapReceipt{Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 97,
 		Host: "node-a", Label: "rv-97", Worktree: "/work/rv-97" + reviewerCheckoutSuffix,
 		Result: "removed", Reason: "pane gone", Time: time.Now().Add(-25 * time.Hour).UTC()})
+	// closeReviewerPane's budget cut is a reviewer-cleanup row, not a sweep
+	// hold: it still queues its PR's refetch (hk 6987).
+	rows = append(rows, reapReceipt{Action: "reviewer-cleanup", Repo: testRepo.Name, PR: 98,
+		Host: "node-a", Label: "rv-98", Worktree: "/work/rv-98" + reviewerCheckoutSuffix,
+		Result: "pending-cleanup", Reason: reviewerBudgetHold,
+		Time: time.Now().Add(-25 * time.Hour).UTC()})
 	seedReapRows(t, s, testRepo.Name, rows...)
 	_ = s.Reap(context.Background(), testRepo, 0, Options{})
 	for pr := 90; pr <= 96; pr++ {
@@ -74,8 +87,10 @@ func TestReapReviewerHeldRowsDoNotRefetchTheirPRs(t *testing.T) {
 			t.Errorf("hold or reviewer-reap row refetched PR %d; fetched %v", pr, gh.prs)
 		}
 	}
-	if !gh.fetched(97) {
-		t.Fatalf("ordinary reviewer-cleanup row did not refetch PR 97; fetched %v", gh.prs)
+	for _, pr := range []int{97, 98} {
+		if !gh.fetched(pr) {
+			t.Fatalf("reviewer-cleanup row did not refetch PR %d; fetched %v", pr, gh.prs)
+		}
 	}
 }
 
