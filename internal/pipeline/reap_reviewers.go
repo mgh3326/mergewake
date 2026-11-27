@@ -167,6 +167,12 @@ const (
 	// probe; the next pass probes those hosts only.
 	reviewerHostsPendingPrefix = "host checkout probe unavailable at "
 	reviewerHostsPendingSuffix = "; the next pass probes only those hosts"
+	// reviewerHostsSeveralPrefix frames the reason of a host-less label whose
+	// checkout two or more reachable hosts hold: which copy is the spawn's is
+	// not known, so nothing is removed, and the names follow the prefix. The
+	// pending row keeps the label visited; an aged label settles terminal with
+	// the same names after reviewerHostUnknown.
+	reviewerHostsSeveralPrefix = "checkout found on several hosts: "
 	// reviewerHostlessMaxAge is how old a host-less label may get while the
 	// only hosts left unanswered are failed or have no work root.
 	reviewerHostlessMaxAge = 7 * 24 * time.Hour
@@ -1772,8 +1778,20 @@ func (w *reviewerSweep) removeUnrecorded(ctx context.Context, l reviewerLabel, c
 // label no record names a host for. only, when set, limits the probes to the
 // hosts a pass left uncertain. It reports false when the visit ends here.
 func (w *reviewerSweep) discoverUnrecorded(ctx context.Context, l reviewerLabel, only map[string]bool) bool {
-	found, uncertain, blocked, capped := w.findUnrecordedCheckout(ctx, l, only)
+	found, uncertain, blocked, capped, copies := w.findUnrecordedCheckout(ctx, l, only)
 	switch {
+	case len(copies) > 1:
+		// Two or more reachable hosts hold a checkout: which one is this
+		// label's is not known, so nothing is removed. The label stays pending
+		// and names the copies, so a later pass probes every host again. Once
+		// the spawn is past reviewerHostlessMaxAge it settles terminal with the
+		// same names, bounded like the failed-host case.
+		names := strings.Join(copies, ", ")
+		if l.started.Add(reviewerHostlessMaxAge).Before(w.now) {
+			w.recordHostless(l, "kept", reviewerHostUnknown+"; "+reviewerHostsSeveralPrefix+names)
+		} else {
+			w.recordHostless(l, "pending-cleanup", reviewerHostsSeveralPrefix+names)
+		}
 	case found != nil && !blocked:
 		// Exactly one reachable host holds the checkout, and the only doubt is
 		// hosts that failed or have no work root: the checkout is removed there.
@@ -1872,14 +1890,14 @@ func (w *reviewerSweep) settleHostlessStream(l reviewerLabel) {
 // on the remote hosts, or only on the hosts in only when it is set. It returns the one host that holds
 // the checkout, the hosts it could not answer for (failed, without a work root,
 // or past the probe allowance), and whether an uncertainty a removal cannot be
-// proven past remains: a probe cap, an inspect error, or a second copy. Two
-// copies name no host at all. The host-less probes have their own allowance,
-// so they never take the legacy-path probes' share. Dry runs probe nothing.
-func (w *reviewerSweep) findUnrecordedCheckout(ctx context.Context, l reviewerLabel, only map[string]bool) (found *reapHost, uncertain []string, blocked bool, capped string) {
+// proven past remains: a probe cap or an inspect error. Two or more copies
+// name no host to remove: they are returned as copies, in host order, and
+// found is nil. The host-less probes have their own allowance, so they never
+// take the legacy-path probes' share. Dry runs probe nothing.
+func (w *reviewerSweep) findUnrecordedCheckout(ctx context.Context, l reviewerLabel, only map[string]bool) (found *reapHost, uncertain []string, blocked bool, capped string, copies []string) {
 	if !w.acting {
-		return nil, nil, false, ""
+		return nil, nil, false, "", nil
 	}
-	matches := 0
 	for _, hs := range w.hosts {
 		if hs.host.Local() || (only != nil && !only[hs.host.Name]) {
 			continue
@@ -1908,14 +1926,14 @@ func (w *reviewerSweep) findUnrecordedCheckout(ctx context.Context, l reviewerLa
 			continue
 		}
 		if tree != nil {
-			matches++
+			copies = append(copies, hs.host.Name)
 			found = hs
 		}
 	}
-	if matches > 1 {
-		return nil, nil, false, ""
+	if len(copies) > 1 {
+		return nil, nil, false, "", copies
 	}
-	return found, uncertain, blocked, capped
+	return found, uncertain, blocked, capped, nil
 }
 
 // takeHostlessProbe spends one host's probe of the spec checkout path for

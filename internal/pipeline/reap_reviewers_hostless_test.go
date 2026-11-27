@@ -223,3 +223,79 @@ func TestReapReviewerHostlessFailedFoundHostDoesNotBlockOwedProbe(t *testing.T) 
 	}
 	t.Fatalf("pass 2 did not probe node-b while node-a failed; rows %v", rowSummary(f.rows(t)))
 }
+
+// Two reachable hosts both hold the host-less label's checkout, so neither copy
+// is proven to be the spawn's: nothing is removed, the label stays pending with
+// a reason that names both hosts, and the next pass visits it again.
+func TestReapReviewerHostlessTwoCopiesStayPendingAndAreRevisited(t *testing.T) {
+	f := newReviewerFix(t, reap.Host{Name: "node-b", Machine: "node-b", WorkRoot: "/work-b"}, reap.Host{Name: "node-c", Machine: "node-c", WorkRoot: "/work-c"})
+	f.s.Config.Hosts[0].WorkRoot = "/work-a"
+	f.hub.moreNodes = []any{
+		map[string]any{"machine_id": "node-b", "state": "connected", "agents": []any{}, "panes": []any{}, "panes_ok": true},
+		map[string]any{"machine_id": "node-c", "state": "connected", "agents": []any{}, "panes": []any{}, "panes_ok": true},
+	}
+	label := reviewerLabelFor(94, 2*24*time.Hour)
+	f.hub.detached["/work-b/"+label+reviewerCheckoutSuffix] = true
+	f.hub.detached["/work-c/"+label+reviewerCheckoutSuffix] = true
+	seedDecisionRows(t, f.s, testRepo.Name, map[string]any{"command": "reviewer-held", "value": map[string]any{"pr": 94, "label": label}})
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if removes := f.hub.ops("worktree.remove"); len(removes) != 0 {
+		t.Fatalf("pass 1 removed a copy of an ambiguous checkout: %v; rows %v", removes, rowSummary(f.rows(t)))
+	}
+	want := reviewerHostsSeveralPrefix + "node-b, node-c"
+	pending := 0
+	for _, row := range f.rows(t) {
+		if row.Result == "pending-cleanup" && row.Host == "" && row.Reason == want {
+			pending++
+		}
+	}
+	if pending != 1 {
+		t.Fatalf("want one pending row naming node-b and node-c; rows %v", rowSummary(f.rows(t)))
+	}
+
+	before := len(f.hub.ops("worktree.inspect"))
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.hub.ops("worktree.inspect")[before:]) == 0 {
+		t.Fatalf("pass 2 did not visit the ambiguous label; rows %v", rowSummary(f.rows(t)))
+	}
+	if removes := f.hub.ops("worktree.remove"); len(removes) != 0 {
+		t.Fatalf("pass 2 removed a copy of an ambiguous checkout: %v", removes)
+	}
+}
+
+// Past the bounded wait an ambiguous host-less label settles terminal, and its
+// row names both hosts that hold a copy. Nothing is removed.
+func TestReapReviewerHostlessTwoCopiesSettleTerminalAfterTheBoundedWait(t *testing.T) {
+	f := newReviewerFix(t, reap.Host{Name: "node-b", Machine: "node-b", WorkRoot: "/work-b"}, reap.Host{Name: "node-c", Machine: "node-c", WorkRoot: "/work-c"})
+	f.s.Config.Hosts[0].WorkRoot = "/work-a"
+	f.hub.moreNodes = []any{
+		map[string]any{"machine_id": "node-b", "state": "connected", "agents": []any{}, "panes": []any{}, "panes_ok": true},
+		map[string]any{"machine_id": "node-c", "state": "connected", "agents": []any{}, "panes": []any{}, "panes_ok": true},
+	}
+	label := reviewerLabelFor(95, reviewerHostlessMaxAge+time.Hour)
+	f.hub.detached["/work-b/"+label+reviewerCheckoutSuffix] = true
+	f.hub.detached["/work-c/"+label+reviewerCheckoutSuffix] = true
+	seedDecisionRows(t, f.s, testRepo.Name, map[string]any{"command": "reviewer-held", "value": map[string]any{"pr": 95, "label": label}})
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if removes := f.hub.ops("worktree.remove"); len(removes) != 0 {
+		t.Fatalf("aged ambiguous checkout was removed: %v", removes)
+	}
+	want := reviewerHostUnknown + "; " + reviewerHostsSeveralPrefix + "node-b, node-c"
+	rows := f.rows(t)
+	if len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != want {
+		t.Fatalf("rows %v, want one kept row %q", rowSummary(rows), want)
+	}
+	nrows := len(rows)
+	if err := f.reap(t, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.rows(t)) != nrows {
+		t.Fatalf("terminal label revisited: %v", rowSummary(f.rows(t)))
+	}
+}
