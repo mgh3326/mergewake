@@ -408,6 +408,51 @@ func TestReapReviewerLegacyPendingRetryChargesProbeAllowance(t *testing.T) {
 	}
 }
 
+// Labels that stay pending on the legacy path must not keep the probe
+// allowance to themselves: the label the allowance held on one pass gets its
+// turn on a later one, so every label is inspected within a few passes.
+func TestReapReviewerLegacyPendingRetryRotatesProbeHold(t *testing.T) {
+	const labelCount = reviewerLegacyProbesPerHost + 1
+	f := newReviewerFix(t)
+	f.s.Config.Hosts[0].WorkRoot = "/work"
+	f.hub.wtHead = "bbbb2222"
+	var initial []reapReceipt
+	labels := make([]string, 0, labelCount)
+	for i := range labelCount {
+		label := reviewerLabelFor(80+i, 3*24*time.Hour)
+		labels = append(labels, label)
+		f.hub.detached["/work/"+label] = true
+		initial = append(initial, reapReceipt{Action: "reviewer-reap", Repo: testRepo.Name, PR: 80 + i,
+			Host: "node-a", Label: label, Worktree: "/work/" + label + reviewerCheckoutSuffix,
+			Result: "skipped", Reason: reviewerAlreadyGone})
+	}
+	seedReapRows(t, f.s, testRepo.Name, initial...)
+	inspected := map[string]bool{}
+	for pass := 1; pass <= 3; pass++ {
+		before := len(f.hub.ops("worktree.inspect"))
+		if err := f.reap(t, 0, Options{}); err != nil {
+			t.Fatal(err)
+		}
+		perPass := 0
+		for _, op := range f.hub.ops("worktree.inspect")[before:] {
+			for _, label := range labels {
+				if op["cwd"] == "/work/"+label {
+					perPass++
+					inspected[label] = true
+				}
+			}
+		}
+		if perPass > reviewerLegacyProbesPerHost {
+			t.Fatalf("pass %d legacy inspects=%d, want at most %d", pass, perPass, reviewerLegacyProbesPerHost)
+		}
+	}
+	for _, label := range labels {
+		if !inspected[label] {
+			t.Fatalf("label %s was never inspected in three passes; rows %v", label, rowSummary(f.rows(t)))
+		}
+	}
+}
+
 func TestReapReviewerAbsentLegacyPathsDoNotUsePerHostDrain(t *testing.T) {
 	f := newReviewerFix(t)
 	f.s.Config.Hosts[0].WorkRoot = "/work"

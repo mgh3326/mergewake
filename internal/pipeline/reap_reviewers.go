@@ -358,6 +358,10 @@ type reviewerSweep struct {
 	// unreadable marks a corrupt sweep cursor the sweep can safely reset.
 	unreadable       bool
 	cursorReadFailed bool
+	// probeHeld is the first label this pass left waiting on the legacy probe
+	// allowance. The next full sweep starts there, so the labels the allowance
+	// keeps waiting take turns (reviewer_cursor.go).
+	probeHeld *reviewerCursor
 }
 
 // reviewerCandidate is one label to visit, the host it is known to run on and,
@@ -663,6 +667,15 @@ func (w *reviewerSweep) takeLegacyProbe(host string) bool {
 	}
 	w.legacyProbes[host]++
 	return true
+}
+
+// noteProbeHeld records the first label the legacy probe allowance held this
+// pass. Labels held later keep their own rows; only the first one moves the
+// next full sweep's cursor.
+func (w *reviewerSweep) noteProbeHeld(label, host string) {
+	if w.probeHeld == nil {
+		w.probeHeld = &reviewerCursor{Host: host, Label: label}
+	}
 }
 
 // hostScanFailed reports whether a host named by a candidate could not be read
@@ -2004,6 +2017,7 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		// A label already recorded on the pre-suffix path (a pending legacy
 		// retry) probes that path here, so it spends the allowance too.
 		rec.Action = "reviewer-cleanup"
+		w.noteProbeHeld(l.name, hs.host.Name)
 		w.record(rec, "pending-cleanup", reviewerLegacyProbeHold)
 		return remoteStop
 	}
@@ -2028,6 +2042,7 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 				// Keep the hold separate from the reviewer-reap stream so the
 				// original already-gone row continues to make this label a candidate.
 				rec.Action = "reviewer-cleanup"
+				w.noteProbeHeld(l.name, hs.host.Name)
 				w.record(rec, "pending-cleanup", reviewerLegacyProbeHold)
 				return remoteStop
 			}

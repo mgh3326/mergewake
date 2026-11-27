@@ -72,10 +72,22 @@ func (w *reviewerSweep) stopAt(c reviewerCandidate) {
 }
 
 // finished clears a cursor the sweep has now passed, so the next full sweep
-// starts from the front of the order again. An unreadable cursor is cleared
+// starts from the front of the order again. A label the legacy probe allowance
+// held this pass takes the cursor instead, so the held labels rotate. An unreadable cursor is cleared
 // too, so the file no longer fails the next pass.
 func (w *reviewerSweep) finished(from reviewerCursor) {
-	if !w.resumable || (from.Label == "" && !w.unreadable) {
+	if !w.resumable {
+		return
+	}
+	if w.probeHeld != nil && !w.cursorReadFailed {
+		// A label the legacy probe allowance held still has its turn to come:
+		// the next full sweep starts with it rather than the front.
+		if e := w.s.saveReviewerSweepCursor(w.r.Name, *w.probeHeld); e != nil {
+			w.errs = append(w.errs, fmt.Errorf("reviewer reap: sweep cursor: %w", e))
+		}
+		return
+	}
+	if from.Label == "" && !w.unreadable {
 		return
 	}
 	if e := w.s.saveReviewerSweepCursor(w.r.Name, reviewerCursor{}); e != nil {
