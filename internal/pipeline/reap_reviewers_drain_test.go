@@ -628,7 +628,7 @@ func TestReapReviewerHostlessCheckoutFindsUniqueHost(t *testing.T) {
 	}
 }
 
-func TestReapReviewerHostlessCheckoutAmbiguousOrAbsentSettlesTerminal(t *testing.T) {
+func TestReapReviewerHostlessCheckoutAbsentOrAmbiguousStaysBoundedAndKeepsCopies(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		onBoth bool
@@ -645,7 +645,15 @@ func TestReapReviewerHostlessCheckoutAmbiguousOrAbsentSettlesTerminal(t *testing
 				t.Fatal(err)
 			}
 			rows := f.rows(t)
-			if len(rows) != 1 || rows[0].Result != "kept" || rows[0].Reason != reviewerHostUnknown || len(f.hub.ops("worktree.remove")) != 0 {
+			// Absent: the label is terminal at once. Ambiguous: the copies on
+			// both hosts are kept and the label stays pending, not terminal.
+			want := reviewerHostUnknown
+			result := "kept"
+			if tc.onBoth {
+				want = reviewerHostsSeveralPrefix + f.s.Config.Hosts[0].Name + ", node-b"
+				result = "pending-cleanup"
+			}
+			if len(rows) != 1 || rows[0].Result != result || rows[0].Reason != want || len(f.hub.ops("worktree.remove")) != 0 {
 				t.Fatalf("rows %v; removes %v", rowSummary(rows), f.hub.ops("worktree.remove"))
 			}
 		})
@@ -691,7 +699,8 @@ func TestReapReviewerHostlessCheckoutCapRetriesDiscoveryAcrossHosts(t *testing.T
 		name       string
 		onA, onB   bool
 		wantRemove string
-	}{{"only-second-host", false, true, "/work-b/"}, {"both-hosts", true, true, ""}} {
+		ambiguous  bool
+	}{{"only-second-host", false, true, "/work-b/", false}, {"both-hosts", true, true, "", true}} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newReviewerFix(t, reap.Host{Name: "node-b", Machine: "node-b", WorkRoot: "/work-b"})
 			f.s.Config.Hosts[0].WorkRoot = "/work-a"
@@ -729,6 +738,29 @@ func TestReapReviewerHostlessCheckoutCapRetriesDiscoveryAcrossHosts(t *testing.T
 				}
 			} else if len(removes) != 0 {
 				t.Fatalf("ambiguous discovery removed a checkout: %v", removes)
+			}
+			if tc.ambiguous {
+				// Two copies are still ambiguous: the label stays pending and
+				// names both hosts, and the next pass probes it again.
+				want := reviewerHostsSeveralPrefix + f.s.Config.Hosts[0].Name + ", node-b"
+				rows := f.rows(t)
+				var last *reapReceipt
+				for i := range rows {
+					if rows[i].Label == target {
+						last = &rows[i]
+					}
+				}
+				if last == nil || last.Result != "pending-cleanup" || last.Reason != want {
+					t.Fatalf("second-pass target row: %v", rowSummary(rows))
+				}
+				beforeInspects := len(f.hub.ops("worktree.inspect"))
+				if err := f.reap(t, 0, Options{}); err != nil {
+					t.Fatal(err)
+				}
+				if len(f.hub.ops("worktree.inspect")) == beforeInspects || len(f.hub.ops("worktree.remove")) != 0 {
+					t.Fatalf("ambiguous label was not revisited, or a copy was removed: rows %v", rowSummary(f.rows(t)))
+				}
+				return
 			}
 			beforeRows, beforeInspects := len(f.rows(t)), len(f.hub.ops("worktree.inspect"))
 			if err := f.reap(t, 0, Options{}); err != nil {
@@ -772,7 +804,7 @@ func TestReapReviewerHostlessProbeUsesVisitContext(t *testing.T) {
 	hs := &reapHost{host: reap.Host{Name: "node", Machine: "node-a", WorkRoot: "/work"}, ops: ops}
 	w := &reviewerSweep{hosts: []*reapHost{hs}, acting: true}
 	label, _ := parseReviewerLabel(reviewerLabelFor(68, 2*24*time.Hour))
-	_, uncertain, blocked, _ := w.findUnrecordedCheckout(ctx, label, nil)
+	_, uncertain, blocked, _, _ := w.findUnrecordedCheckout(ctx, label, nil)
 	if (len(uncertain) == 0 && !blocked) || ops.got != ctx {
 		t.Fatalf("discovery did not use the canceled visit context: uncertain=%v blocked=%t got=%v want=%v", uncertain, blocked, ops.got, ctx)
 	}
