@@ -259,3 +259,43 @@ func TestReviewRefusesDiffWhoseHeadersAloneExceedBudget(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+// elidedPR is an oversized PR: a large file whose hunk is elided under the test
+// budget, and a small file that always stays. index, start and ctx vary with
+// the base the head was built on; added is the file's one changed line.
+func elidedPR(index string, start int, ctx, added string) string {
+	big := "diff --git a/big.txt b/big.txt\nindex " + index + " 100644\n--- a/big.txt\n+++ b/big.txt\n" +
+		"@@ -" + itoa(start) + ",51 +" + itoa(start) + ",51 @@\n" +
+		strings.Repeat(" "+ctx+" "+strings.Repeat("c", 20)+"\n", 50) + "-old\n+" + added + "\n"
+	small := "diff --git a/small.txt b/small.txt\nindex 3333333..4444444 100644\n--- a/small.txt\n+++ b/small.txt\n" +
+		"@@ -1,3 +1,3 @@\n keep\n-old\n+new\n end\n"
+	return big + small
+}
+
+// A base merge that only shifts an elided file's context and line numbers must
+// keep the review's patch id: the elided digest covers the changed lines only.
+func TestElidedPatchIDIgnoresBaseMergeShift(t *testing.T) {
+	const budget = 400
+	before := elidedPR("1111111..2222222", 1, "keep", "new")
+	after := elidedPR("aaaaaaa..bbbbbbb", 41, "kept", "new")
+	a, sa := summarizeLocalDiff(before, budget)
+	b, sb := summarizeLocalDiff(after, budget)
+	if !slices.Contains(sa, "big.txt") || !slices.Contains(sb, "big.txt") {
+		t.Fatalf("big.txt was not elided: %v %v", sa, sb)
+	}
+	ida, idb := reviewPatchID(a), reviewPatchID(b)
+	if ida == "" || ida != idb {
+		t.Fatalf("a base merge that only shifted an elided file changed the patch id: %q != %q", ida, idb)
+	}
+}
+
+// One changed line in an elided file is a different patch, so the digest must
+// still move with the + and - lines.
+func TestElidedPatchIDTracksChangedLine(t *testing.T) {
+	const budget = 400
+	a, _ := summarizeLocalDiff(elidedPR("1111111..2222222", 1, "keep", "new"), budget)
+	b, _ := summarizeLocalDiff(elidedPR("1111111..2222222", 1, "keep", "newer"), budget)
+	if reviewPatchID(a) == reviewPatchID(b) {
+		t.Fatal("a changed + line in an elided file kept the patch id")
+	}
+}

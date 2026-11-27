@@ -440,7 +440,7 @@ func summarizeLocalDiff(diff string, budget int) (string, []string) {
 		}
 		b.WriteString(headers[i])
 		b.WriteString(elidedNote)
-		fmt.Fprintf(&b, "%x\n", sha256.Sum256([]byte(blocks[i])))
+		fmt.Fprintf(&b, "%x\n", elidedDigest(f))
 		if p := diffFilePath(f); p != "" {
 			summarized = append(summarized, p)
 		}
@@ -513,6 +513,36 @@ func elidedHeader(f diffFile) string {
 		}
 	}
 	return b.String()
+}
+
+// elidedDigest digests the text an elided block still stands for, the same
+// text the strict patch hash covers: the file headers and the added and removed
+// lines. Context lines, hunk headers and the index line (blob ids, which a base
+// merge moves) are left out, so a base merge that only shifts them keeps the
+// digest, and therefore the patch id, unchanged.
+func elidedDigest(f diffFile) [sha256.Size]byte {
+	var b strings.Builder
+	for _, line := range f.head {
+		if strings.HasPrefix(line, "index ") {
+			continue
+		}
+		b.WriteString(withNewline(line))
+	}
+	for _, h := range f.hunks {
+		for _, line := range h.lines {
+			if line != "" && (line[0] == '+' || line[0] == '-') {
+				b.WriteString(withNewline(line))
+			}
+		}
+	}
+	return sha256.Sum256([]byte(b.String()))
+}
+
+func withNewline(line string) string {
+	if strings.HasSuffix(line, "\n") {
+		return line
+	}
+	return line + "\n"
 }
 
 // diffFilePath is the new-side path, or the old one for a deletion, or the
