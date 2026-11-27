@@ -11,11 +11,13 @@ import (
 	"testing"
 
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/integrations"
 	"github.com/mgh3326/mergewake/internal/policy"
 )
 
 // realGitRunner runs git against a test repository and delegates every other
-// command to fakeRunner.
+// command to fakeRunner. A successful answer over the daemon runner's output
+// bound returns integrations.ErrOutputLimit, as the daemon's runner does.
 type realGitRunner struct{ fakeRunner }
 
 func (r *realGitRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
@@ -23,6 +25,9 @@ func (r *realGitRunner) Run(ctx context.Context, command string, args []string, 
 		b, e := exec.CommandContext(ctx, "git", args...).CombinedOutput()
 		if e != nil {
 			return b, e
+		}
+		if len(b) > 4<<20 {
+			return nil, integrations.ErrOutputLimit
 		}
 		return b, nil
 	}

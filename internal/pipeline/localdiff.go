@@ -14,6 +14,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/config"
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
 // reviewDiffBudget bounds the diff text one review pass hands a reviewer. The
@@ -120,9 +121,11 @@ func (s *Service) localDiff(ctx context.Context, r config.Repo, pr github.Pull) 
 }
 
 // baseChangesDropped checks each first-parent merge's own result. A base commit
-// counts when it added a line present in that merge's second parent but absent
-// from the merge tree. Later PR commits do not affect the attribution. The
-// verdict is cached for an unchanged base/head pair.
+// counts when a merge lost a line it added: the merge's second parent has the
+// line and the merge tree does not. A lost line the PR head still carries, or
+// that the PR's net diff (merge-base..head) adds back or edits, is reviewed
+// there and does not count (hk 7021). The verdict is cached for an unchanged
+// base/head pair.
 func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr github.Pull) ([]string, error) {
 	root := config.Expand(r.Root)
 	if root == "" || s.Runner == nil || pr.Head.SHA == "" || pr.Base.SHA == "" {
@@ -184,6 +187,9 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 		return nil, &baseDropUnverified{cause: "history_limit", err: fmt.Errorf("PR has more than %d first-parent merges", baseDropMergeLimit)}
 	}
 	affected := map[string]bool{}
+	// lost maps a base commit and path to the largest count of its lines that a
+	// merge's second parent had and the merge tree lost.
+	lost := map[string]map[string]int{}
 	commitsSeen := map[string]bool{}
 	lineCount := 0
 	fileCache := map[string]map[string]map[string]int{}
@@ -264,9 +270,35 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 					return nil, fmt.Errorf("read merge line origins for %s: %w", mergePath, err)
 				}
 				if inMerge < atSecondParent {
-					affected[commit] = true
+					if lost[commit] == nil {
+						lost[commit] = map[string]int{}
+					}
+					lost[commit][mergePath] = max(lost[commit][mergePath], atSecondParent)
 				}
 			}
+		}
+	}
+	// A lost line counts only when the head does not carry it and the PR's net
+	// diff does not account for it. A merge resolution that edits a base line, or
+	// a later merge that restores it, shows in the net diff.
+	for commit, paths := range lost {
+		for path, expected := range paths {
+			atHead, err := fileLineOriginCount(git, pr.Head.SHA, path, commit, fileCache)
+			if err != nil {
+				return nil, fmt.Errorf("read head line origins for %s: %w", path, err)
+			}
+			missing := expected - atHead
+			if missing <= 0 {
+				continue
+			}
+			added, err := netAddedLines(git, mergeBase, pr.Head.SHA, path)
+			if err != nil {
+				return nil, fmt.Errorf("read PR net diff for %s: %w", path, err)
+			}
+			if added >= missing {
+				continue
+			}
+			affected[commit] = true
 		}
 	}
 	var dropped []string
@@ -359,6 +391,20 @@ func renamedPaths(status string) map[string]string {
 	return result
 }
 
+// netAddedLines counts the lines the PR's net diff (base..head) adds to path. A
+// binary file has no line count and adds none.
+func netAddedLines(git func(...string) (string, error), base, head, path string) (int, error) {
+	text, err := git("diff", "--numstat", "-z", "--no-renames", base, head, "--", ":(literal)"+path)
+	if err != nil {
+		return 0, err
+	}
+	added, _, _ := strings.Cut(text, "\t")
+	if added == "" || added == "-" {
+		return 0, nil
+	}
+	return strconv.Atoi(added)
+}
+
 func fileLineOriginCount(git func(...string) (string, error), revision, path, origin string, cache map[string]map[string]map[string]int) (int, error) {
 	byPath := cache[revision]
 	if byPath == nil {
@@ -374,6 +420,9 @@ func fileLineOriginCount(git func(...string) (string, error), revision, path, or
 	// line, so the line-origin count below reads the same from either form.
 	text, err := git("blame", "--root", "--porcelain", revision, "--", path)
 	if err != nil {
+		if errors.Is(err, integrations.ErrOutputLimit) {
+			return 0, &baseDropUnverified{cause: "blame_limit", err: fmt.Errorf("base-drop blame for %s exceeds runner output limit", path)}
+		}
 		// A missing path has no blamed lines. Query one literal path so a
 		// missing blob or other object error still fails closed.
 		tree, treeErr := git("ls-tree", "-r", "--name-only", "-z", revision, "--", pathspec)
@@ -385,9 +434,6 @@ func fileLineOriginCount(git func(...string) (string, error), revision, path, or
 			return 0, nil
 		}
 		return 0, err
-	}
-	if len(text) >= 4<<20 {
-		return 0, &baseDropUnverified{cause: "blame_limit", err: fmt.Errorf("base-drop blame for %s exceeds runner output limit", path)}
 	}
 	counts := map[string]int{}
 	for _, line := range strings.Split(text, "\n") {

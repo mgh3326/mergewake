@@ -15,6 +15,7 @@ import (
 
 	"github.com/mgh3326/mergewake/internal/fsutil"
 	"github.com/mgh3326/mergewake/internal/github"
+	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
 func baseDropGit(t *testing.T, dir string, args ...string) string {
@@ -142,6 +143,29 @@ func baseDropRepo(t *testing.T, mode string) (root, base, head string) {
 		write("combined base and feature sides\n")
 		baseDropGit(t, src, "add", "tracked.txt")
 		baseDropGit(t, src, "commit", "-m", "resolve by combining both sides")
+	case "edit_then_restore", "edit_kept":
+		// An early merge resolves the base line by hand, then a later merge of
+		// the same base commit either restores the base line or keeps the edit.
+		write("legacy line\nfeature edit\n")
+		baseDropGit(t, src, "commit", "-am", "feature edits the base line")
+		cmd := exec.Command("git", "-C", src, "merge", "main", "-m", "early merge")
+		if out, err := cmd.CombinedOutput(); err == nil {
+			t.Fatalf("expected merge conflict, got success: %s", out)
+		}
+		write("legacy line\nauthor edit\n")
+		baseDropGit(t, src, "add", "tracked.txt")
+		baseDropGit(t, src, "commit", "-m", "resolve early merge by editing the base line")
+		// git merge refuses to re-merge an ancestor, so the later merge of the
+		// same base commit is written as a merge commit with that parent.
+		laterText := "legacy line\nauthor edit\n"
+		if mode == "edit_then_restore" {
+			laterText = "legacy line\nbase addition\n"
+		}
+		write(laterText)
+		baseDropGit(t, src, "add", "tracked.txt")
+		tree := baseDropGit(t, src, "write-tree")
+		later := baseDropGit(t, src, "commit-tree", tree, "-p", "HEAD", "-p", base, "-m", "later merge of base")
+		baseDropGit(t, src, "reset", "--hard", later)
 	case "no_merge":
 		write("branch edit\n")
 		baseDropGit(t, src, "commit", "-am", "edit pre-fork line")
@@ -166,10 +190,16 @@ func TestGateBaseChangeDropped(t *testing.T) {
 		{mode: "both", want: ""},
 		{mode: "edit_after_merge", want: ""},
 		{mode: "rename_after_merge", want: ""},
-		// The base's exact added line is absent from the merge tree. Under the
-		// gate's line-survival definition, replacing it with a combined line is
-		// a drop even though the author intended to preserve its meaning.
-		{mode: "combine", want: "base_change_dropped:1"},
+		// An early merge edits the base's added line on purpose and a later
+		// merge restores it: the head carries the line, so no drop (hk 7021).
+		{mode: "edit_then_restore", want: ""},
+		// The #630 shape: the base's added line is edited on purpose in an early
+		// merge and kept edited. The PR's net diff shows the edit, so no drop.
+		{mode: "edit_kept", want: ""},
+		// The base's added line is replaced by a combined line in the merge
+		// resolution and the head keeps it. The PR's net diff shows the
+		// replacement, so it is reviewed there rather than blocked as a drop.
+		{mode: "combine", want: ""},
 		{mode: "no_merge", want: ""},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
@@ -567,6 +597,39 @@ func TestGateBaseDropVerificationErrorIsUnverifiedReason(t *testing.T) {
 		if strings.HasPrefix(reason, "base_change_dropped:") {
 			t.Fatalf("verification error reported as a dropped change: %v", v.Reasons)
 		}
+	}
+}
+
+// blameOverflowRunner answers every blame the way the daemon's runner does when
+// the output exceeds its bound (hk 7023).
+type blameOverflowRunner struct{ *realGitRunner }
+
+func (r blameOverflowRunner) Run(ctx context.Context, command string, args []string, input, dir string) ([]byte, error) {
+	if command == "git" && slices.Contains(args, "blame") {
+		return nil, integrations.ErrOutputLimit
+	}
+	return r.realGitRunner.Run(ctx, command, args, input, dir)
+}
+
+func TestGateBaseDropBlameOverflowIsBlameLimit(t *testing.T) {
+	root, base, head := baseDropRepo(t, "drop")
+	s, g, _, _, r := setup(t)
+	r.Root = root
+	s.Runner = blameOverflowRunner{&realGitRunner{fakeRunner: *s.Runner.(*fakeRunner)}}
+	g.pull.Base = github.Ref{Ref: "main", SHA: base}
+	g.pull.Head = github.Ref{Ref: "feature", SHA: head}
+	g.pull.Head.Repo.FullName = r.Name
+	g.pull.ChangedFiles = 1
+	p, err := s.Policy(context.Background(), r, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := s.mergeGate(context.Background(), r, g.pull, p, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(v.Reasons, "base_drop_unverified:blame_limit") {
+		t.Fatalf("overflowing blame reasons = %v, want base_drop_unverified:blame_limit", v.Reasons)
 	}
 }
 
