@@ -214,6 +214,9 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 	// result is decided once and the automatic revert stops.
 	mixedHead := recorded && !inc.Confirmed && inc.Baseline != "" && inc.Culprit == head
 	confirmedHead := recorded && inc.Confirmed && inc.Baseline != "" && inc.Culprit == head
+	// A shadow or dry pass persists nothing: it never writes or reads the
+	// confirmation marker, so it keeps today's result.
+	acting := !result.Shadow && !o.DryRun
 	ci, e := s.GH.Check(ctx, r.Name, head, checks)
 	if e != nil {
 		if errors.Is(e, github.ErrAmbiguousCheck) {
@@ -223,6 +226,9 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 			if mixedHead {
 				return s.recoverHeadCulprit(ctx, r, p, head, checks, result, o, inc)
 			}
+			if !acting {
+				return e
+			}
 			m, found, re := s.readRedSeen(r.Name)
 			if re != nil {
 				return re
@@ -230,8 +236,8 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 			// The mixed hold is for a held culprit inside its window. Once the
 			// window has run out the culprit is confirmed durably, so the hold
 			// never outlasts it; a confirmed culprit fails as it did before the
-			// window. A shadow or dry pass only reads, so it never holds here.
-			if found && m.Culprit == head && !m.Confirmed && !result.Shadow && !o.DryRun {
+			// window.
+			if found && m.Culprit == head && !m.Confirmed {
 				if s.Service.now().Sub(m.Since) < s.confirmWindow() {
 					result.Action = "hold"
 					result.Reason = "mixed result: a passing rerun status sits beside the red check run; held, not reverted"
@@ -246,9 +252,6 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 		return e
 	}
 	checkpoint := s.checkpoint(r.Name)
-	// A shadow or dry pass persists nothing: it never writes or reads the
-	// confirmation marker, so it keeps today's result.
-	acting := !result.Shadow && !o.DryRun
 	window := s.confirmWindow()
 	if ci == github.Green {
 		if !s.deploy && !o.DryRun {
