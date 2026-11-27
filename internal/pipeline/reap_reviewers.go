@@ -198,7 +198,11 @@ const (
 	// check the pre-suffix worktree layout for an already-gone label.
 	reviewerLegacyProbeHold = "legacy path probe cap reached for this host; the next pass continues"
 	reviewerHostProbeHold   = "host checkout probe cap reached at %s; the next pass continues"
-	reviewerHostDiscovered  = "host discovery resolved; cleanup is tracked on the host stream"
+	// reviewerRecreatedRemoved is the reason of a removed row for a checkout a
+	// same-label revival recreated at a path an earlier removed row names. It
+	// differs from that row's reason, so the second removal is not a repeat.
+	reviewerRecreatedRemoved = "recreated checkout at a removed path removed again"
+	reviewerHostDiscovered   = "host discovery resolved; cleanup is tracked on the host stream"
 	// reviewerLegacyProbesPerHost bounds the remote fallback probes independently
 	// of guarded removals. The old-path backlog must not monopolize a pass.
 	reviewerLegacyProbesPerHost = 5
@@ -1460,9 +1464,10 @@ func jobOtherRepo(job integrations.JobRecord, repo string) string {
 
 // closeRetryBlocked also honors the last durable close failure after a daemon
 // restart. The in-memory schedule provides increasing delays; the receipt
-// keeps a restart from immediately repeating the same failing CLI call. A kept
-// not-closable row (reviewerNotClosable or reviewerOutOfScope) restores the
-// backoff the same way an abandon-job error row does (hk 6010).
+// keeps a restart from immediately repeating the same failing CLI call. An
+// abandon-job error row's own deadline governs (hk 6964); one without a
+// deadline is expired (hk 6983). A kept not-closable row (reviewerNotClosable
+// or reviewerOutOfScope) restores its backoff from the row (hk 6010).
 func (w *reviewerSweep) closeRetryBlocked(label string, pass uint64) bool {
 	if !w.s.reapRetryAllowed(w.r.Name, label, pass) {
 		return true
@@ -1479,7 +1484,9 @@ func (w *reviewerSweep) closeRetryBlocked(label string, pass uint64) bool {
 				// one-off reap retries once it has passed (hk 6964).
 				return w.s.reapRetryResume(w.r.Name, label, key, row.RetryAfter)
 			}
-			return w.s.reapRetryRestore(w.r.Name, label, key, pass)
+			// A row an older version wrote has no deadline: it is expired, so the
+			// close is tried again rather than blocking every fresh reap (hk 6983).
+			continue
 		}
 		if row.Result == "kept" && (row.Reason == reviewerNotClosable || row.Reason == reviewerOutOfScope) {
 			if !row.RetryAfter.IsZero() {
@@ -2053,12 +2060,21 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 	case reviewerWaiting(prior, w.now):
 		return remoteStop
 	}
-	if prior.Result == "removed" {
-		// An earlier pass removed this worktree, but a same-label revival can
-		// recreate it at the same path (hk 6964). Only an absent tree is done:
-		// no hub call, no row, no legacy probe. A present tree takes the
-		// guarded path below, pane guard included.
-		if tree, e := hs.ops.Inspect(ctx, cwd); e == nil && tree == nil {
+	// A removed stream's worktree may be recreated at the same path by a
+	// same-label revival (hk 6964). The probe below is a hub call, so it spends
+	// the host's probe allowance (hk 6983): a label the allowance holds waits
+	// for a later pass, with its removed row untouched.
+	recreated := prior.Result == "removed"
+	if recreated {
+		if !w.takeLegacyProbe(hs.host.Name) {
+			w.noteProbeHeld(l.name, hs.host.Name)
+			return remoteStop
+		}
+		// Only a successful inspect that shows a tree goes on to the guarded
+		// path, pane guard included. An absent tree is done: no hub call, no
+		// row. A failed inspect proves nothing about the tree, so the removed
+		// row stays and the host is not failed by this probe (hk 6983).
+		if tree, e := hs.ops.Inspect(ctx, cwd); e != nil || tree == nil {
 			return remoteDone
 		}
 	}
@@ -2129,6 +2145,10 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 		}
 	}
 	switch {
+	case e != nil && recreated:
+		// The removed row stays, as for the probe above: an error here is not a
+		// new state of the worktree, and it must not fail the host (hk 6983).
+		return remoteDone
 	case reviewerBudgetCut(ctx, e):
 		w.record(rec, "pending-cleanup", reviewerBudgetHold)
 		return remoteStop
@@ -2169,6 +2189,14 @@ func (w *reviewerSweep) removeRemote(ctx context.Context, hs *reapHost, l review
 	}
 	result, reason := worktreeRemoveVerdict(removed)
 	switch {
+	case result == "removed" && recreated:
+		// The earlier removed row has the same key and result, so a plain
+		// "removed" would be dropped as a repeat. This row names the recreated
+		// checkout, so the second removal is recorded and counted (hk 6983).
+		// The instant keeps a third removal at this path from repeating the
+		// second row's reason.
+		w.record(rec, "removed", fmt.Sprintf("%s (%s)", reviewerRecreatedRemoved, w.now.UTC().Format(time.RFC3339)))
+		return remoteDone
 	case result == "removed":
 		w.record(rec, "removed", "")
 		return remoteDone

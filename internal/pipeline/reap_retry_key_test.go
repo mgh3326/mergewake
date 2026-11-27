@@ -81,12 +81,12 @@ func TestAbandonRetryKeyIsStableFailureID(t *testing.T) {
 	}
 }
 
-// A restart restores the backoff from the row's own retry key, not from the
-// reason text, which carries stderr that may differ from the key.
+// A restart restores the backoff from the row's own retry key and deadline, not
+// from the reason text, which carries stderr that may differ from the key.
 func TestReapReviewerCloseRetryRestoresFromRetryKey(t *testing.T) {
 	s := &Service{Now: func() time.Time { return reviewerNow }}
 	w := &reviewerSweep{s: s, r: config.Repo{Name: testRepo.Name}, streams: map[string]map[string]reapReceipt{
-		"label": {"abandon": {Result: "error", Reason: "abandon job: close refused: .close-9.tmp", RetryKey: "exit 5 other"}},
+		"label": {"abandon": {Result: "error", Reason: "abandon job: close refused: .close-9.tmp", RetryKey: "exit 5 other", RetryAfter: reviewerNow.Add(time.Hour)}},
 	}}
 	if !w.closeRetryBlocked("label", 1) {
 		t.Fatal("a durable failure row did not hold its retry")
@@ -99,20 +99,21 @@ func TestReapReviewerCloseRetryRestoresFromRetryKey(t *testing.T) {
 	}
 }
 
-// A row an older version wrote has no retry key: its reason text is the key,
-// as before, so a restart onto the new binary keeps the backoff.
-func TestReapReviewerCloseRetryRestoresLegacyRowFromReason(t *testing.T) {
+// A row an older version wrote has no deadline. It is expired (hk 6983): a
+// restart onto the new binary tries the close again rather than restoring a
+// backoff from the row, so a one-off reap is not blocked by it.
+func TestReapReviewerCloseRetryLegacyRowWithoutDeadlineIsExpired(t *testing.T) {
 	s := &Service{Now: func() time.Time { return reviewerNow }}
 	w := &reviewerSweep{s: s, r: config.Repo{Name: testRepo.Name}, streams: map[string]map[string]reapReceipt{
 		"label": {"abandon": {Result: "error", Reason: "abandon job: panewire exit status 5 owner_mismatch"}},
 	}}
-	if !w.closeRetryBlocked("label", 1) {
-		t.Fatal("a legacy failure row did not hold its retry")
+	if w.closeRetryBlocked("label", 1) {
+		t.Fatal("a legacy failure row without a deadline held its retry")
 	}
 	state := s.reapState()
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if got := state.retries[testRepo.Name+"\x00label"].failure; got != "panewire exit status 5 owner_mismatch" {
-		t.Fatalf("restored key %q, want the reason text of the legacy row", got)
+	if _, ok := state.retries[testRepo.Name+"\x00label"]; ok {
+		t.Fatal("a legacy failure row restored a backoff from its reason")
 	}
 }
