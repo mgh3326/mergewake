@@ -909,8 +909,11 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		// Receipt-named PRs can be older than the listing horizon. A fetch
 		// failure only loses that PR this pass; it never aborts the rest.
 		for _, rec := range receipts {
-			// The reviewer sweep covers its own rows whatever the PR's state.
-			if rec.PR == 0 || rec.Action == "reviewer-reap" || known[rec.PR] || h.prDone(rec.PR) || now.Sub(h.lastPRCheck[rec.PR]) < refetchAfter {
+			// The reviewer sweep covers its own rows whatever the PR's state, so
+			// reviewer rows, probe-cap holds included, never queue a refetch.
+			// A check-pr stamp is the attempt a reviewer hold queued, so it
+			// never queues a refetch itself; it still stamps lastPRCheck.
+			if rec.PR == 0 || reviewerRow(rec) || rec.Action == "check-pr" || known[rec.PR] || h.prDone(rec.PR) || now.Sub(h.lastPRCheck[rec.PR]) < refetchAfter {
 				continue
 			}
 			known[rec.PR] = true
