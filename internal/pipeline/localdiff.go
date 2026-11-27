@@ -463,12 +463,14 @@ func fileBlame(git func(...string) (string, error), revision, path string, cache
 			return nil, &baseDropUnverified{cause: "blame_limit", err: fmt.Errorf("base-drop blame for %s exceeds runner output limit", path)}
 		}
 		// A missing path has no blamed lines. Query one literal path so a
-		// missing blob or other object error still fails closed.
+		// missing blob or other object error still fails closed. A directory
+		// at the path lists only the files under it, so the path counts as
+		// present only when a blob is listed under exactly that name (hk 7041).
 		tree, treeErr := git("ls-tree", "-r", "--name-only", "-z", revision, "--", ":(literal)"+path)
 		if treeErr != nil {
 			return nil, treeErr
 		}
-		if len(tree) == 0 {
+		if !slices.Contains(strings.Split(tree, "\x00"), path) {
 			cache[key] = nil
 			return nil, nil
 		}
