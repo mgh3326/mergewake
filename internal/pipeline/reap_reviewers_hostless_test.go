@@ -299,3 +299,68 @@ func TestReapReviewerHostlessTwoCopiesSettleTerminalAfterTheBoundedWait(t *testi
 		t.Fatalf("terminal label revisited: %v", rowSummary(f.rows(t)))
 	}
 }
+
+// Two hosts hold a host-less label's checkout. On the next pass one of them
+// cannot answer. A single copy seen now proves nothing about that host, so no
+// copy is removed on that pass or after the host recovers, and both hosts stay
+// named as holding a copy.
+func TestReapReviewerHostlessAmbiguityHoldsWhenACopyHostIsDown(t *testing.T) {
+	for _, tc := range []struct{ name, down string }{{"node-b down", "node-b"}, {"node-c down", "node-c"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newReviewerFix(t, reap.Host{Name: "node-b", Machine: "node-b", WorkRoot: "/work-b"}, reap.Host{Name: "node-c", Machine: "node-c", WorkRoot: "/work-c"})
+			f.s.Config.Hosts[0].WorkRoot = "/work-a"
+			f.hub.moreNodes = []any{
+				map[string]any{"machine_id": "node-b", "state": "connected", "agents": []any{}, "panes": []any{}, "panes_ok": true},
+				map[string]any{"machine_id": "node-c", "state": "connected", "agents": []any{}, "panes": []any{}, "panes_ok": true},
+			}
+			label := reviewerLabelFor(96, 2*24*time.Hour)
+			pathB := "/work-b/" + label + reviewerCheckoutSuffix
+			pathC := "/work-c/" + label + reviewerCheckoutSuffix
+			f.hub.detached[pathB] = true
+			f.hub.detached[pathC] = true
+			seedDecisionRows(t, f.s, testRepo.Name, map[string]any{"command": "reviewer-held", "value": map[string]any{"pr": 96, "label": label}})
+			if err := f.reap(t, 0, Options{}); err != nil {
+				t.Fatal(err)
+			}
+			if removes := f.hub.ops("worktree.remove"); len(removes) != 0 {
+				t.Fatalf("pass 1 removed: %v", removes)
+			}
+
+			// Pass 2: the down host cannot be inspected.
+			downPath := "/work-b/" + label + reviewerCheckoutSuffix
+			if tc.down == "node-c" {
+				downPath = pathC
+			}
+			f.hub.inspectErr = map[string]string{downPath: "node_timeout"}
+			if err := f.reap(t, 0, Options{}); err != nil {
+				t.Fatal(err)
+			}
+			if removes := f.hub.ops("worktree.remove"); len(removes) != 0 {
+				t.Fatalf("pass 2 removed a copy while %s could not answer: %v; rows %v", tc.down, removes, rowSummary(f.rows(t)))
+			}
+			want := reviewerHostsSeveralPrefix + "node-b, node-c"
+			if !hasHostlessRow(f.rows(t), "pending-cleanup", want) {
+				t.Fatalf("pass 2 lost the names of both copy hosts; rows %v", rowSummary(f.rows(t)))
+			}
+
+			// Pass 3: the host answers again; both copies are still there.
+			f.hub.inspectErr = nil
+			if err := f.reap(t, 0, Options{}); err != nil {
+				t.Fatal(err)
+			}
+			if removes := f.hub.ops("worktree.remove"); len(removes) != 0 {
+				t.Fatalf("pass 3 removed an ambiguous copy: %v; rows %v", removes, rowSummary(f.rows(t)))
+			}
+		})
+	}
+}
+
+// hasHostlessRow reports whether a host-less row with the result and reason exists.
+func hasHostlessRow(rows []reapReceipt, result, reason string) bool {
+	for _, row := range rows {
+		if row.Host == "" && row.Result == result && row.Reason == reason {
+			return true
+		}
+	}
+	return false
+}

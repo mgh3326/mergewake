@@ -1778,20 +1778,19 @@ func (w *reviewerSweep) removeUnrecorded(ctx context.Context, l reviewerLabel, c
 // label no record names a host for. only, when set, limits the probes to the
 // hosts a pass left uncertain. It reports false when the visit ends here.
 func (w *reviewerSweep) discoverUnrecorded(ctx context.Context, l reviewerLabel, only map[string]bool) bool {
+	prior := w.ambiguousCopies(l)
 	found, uncertain, blocked, capped, copies := w.findUnrecordedCheckout(ctx, l, only)
 	switch {
+	case len(prior) > 0 && (len(uncertain) > 0 || blocked):
+		// The label was ambiguous and a host still cannot answer: one copy
+		// seen now proves nothing about the host that is down, so nothing is
+		// removed. The copies named before stay named.
+		w.recordSeveral(l, w.copyHosts(prior, copies))
 	case len(copies) > 1:
 		// Two or more reachable hosts hold a checkout: which one is this
 		// label's is not known, so nothing is removed. The label stays pending
-		// and names the copies, so a later pass probes every host again. Once
-		// the spawn is past reviewerHostlessMaxAge it settles terminal with the
-		// same names, bounded like the failed-host case.
-		names := strings.Join(copies, ", ")
-		if l.started.Add(reviewerHostlessMaxAge).Before(w.now) {
-			w.recordHostless(l, "kept", reviewerHostUnknown+"; "+reviewerHostsSeveralPrefix+names)
-		} else {
-			w.recordHostless(l, "pending-cleanup", reviewerHostsSeveralPrefix+names)
-		}
+		// and names the copies, so a later pass probes every host again.
+		w.recordSeveral(l, copies)
 	case found != nil && !blocked:
 		// Exactly one reachable host holds the checkout, and the only doubt is
 		// hosts that failed or have no work root: the checkout is removed there.
@@ -1833,6 +1832,49 @@ func (w *reviewerSweep) discoverUnrecorded(ctx context.Context, l reviewerLabel,
 		}
 	}
 	return true
+}
+
+// recordSeveral writes the row of a host-less label whose checkout two or more
+// hosts hold, naming them. It stays pending; once the spawn is past
+// reviewerHostlessMaxAge it settles terminal with the same names, bounded like
+// the failed-host case.
+func (w *reviewerSweep) recordSeveral(l reviewerLabel, hosts []string) {
+	names := reviewerHostsSeveralPrefix + strings.Join(hosts, ", ")
+	if l.started.Add(reviewerHostlessMaxAge).Before(w.now) {
+		w.recordHostless(l, "kept", reviewerHostUnknown+"; "+names)
+		return
+	}
+	w.recordHostless(l, "pending-cleanup", names)
+}
+
+// ambiguousCopies names the hosts the pending several-hosts row of a host-less
+// label holds, in host order; nil when the label is not ambiguous.
+func (w *reviewerSweep) ambiguousCopies(l reviewerLabel) []string {
+	v, ok := w.streams[l.name][reviewerStream(reapReceipt{Worktree: l.name})]
+	if !ok || reviewerTerminal(v) || v.Result != "pending-cleanup" {
+		return nil
+	}
+	rest, ok := strings.CutPrefix(v.Reason, reviewerHostsSeveralPrefix)
+	if !ok {
+		return nil
+	}
+	return strings.Split(rest, ", ")
+}
+
+// copyHosts merges the hosts an ambiguity named before with the hosts this
+// pass found a copy on, in host order.
+func (w *reviewerSweep) copyHosts(prior, now []string) []string {
+	in := map[string]bool{}
+	for _, n := range append(append([]string{}, prior...), now...) {
+		in[n] = true
+	}
+	var out []string
+	for _, hs := range w.hosts {
+		if in[hs.host.Name] {
+			out = append(out, hs.host.Name)
+		}
+	}
+	return out
 }
 
 // recordHostless writes a row on the label's host-less stream, the one a
