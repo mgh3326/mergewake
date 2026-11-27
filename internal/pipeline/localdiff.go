@@ -311,15 +311,29 @@ func (s *Service) baseChangesDropped(ctx context.Context, r config.Repo, pr gith
 		if err != nil {
 			return nil, fmt.Errorf("read head line texts for %s: %w", c.headPath, err)
 		}
-		baseAll, headAll := map[string]int{}, map[string]int{}
+		// A verbatim copy at the base-side path counts too, when the path
+		// still exists at head: a later commit can restore the original
+		// path after a rename. Each path is counted on its own, never summed.
+		var headOriginalLines []blameLine
+		if c.headPath != c.path {
+			headOriginalLines, err = fileBlame(git, pr.Head.SHA, c.path, blames)
+			if err != nil {
+				return nil, fmt.Errorf("read head line texts for %s: %w", c.path, err)
+			}
+		}
+		baseAll, headAll, headOriginalAll := map[string]int{}, map[string]int{}, map[string]int{}
 		for _, line := range baseLines {
 			baseAll[line.text]++
 		}
 		for _, line := range headLines {
 			headAll[line.text]++
 		}
+		for _, line := range headOriginalLines {
+			headOriginalAll[line.text]++
+		}
 		for _, line := range baseLines {
-			if line.origin == c.commit && baseAll[line.text] > headAll[line.text] {
+			carried := max(headAll[line.text], headOriginalAll[line.text])
+			if line.origin == c.commit && baseAll[line.text] > carried {
 				affected[c.commit] = true
 				break
 			}
@@ -418,7 +432,8 @@ func renamedPaths(status string) map[string]string {
 // dropCandidate is a base commit's lines that a merge lost: the base side
 // (a merge's second parent) carries them at path and the merge does not. The
 // head's copy of them lives at headPath, which equals path unless a rename
-// moved the file.
+// moved the file; a copy at path itself, if the head still has that path,
+// also carries them.
 type dropCandidate struct {
 	commit   string
 	base     string
