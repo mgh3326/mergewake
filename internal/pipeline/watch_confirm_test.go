@@ -257,3 +257,25 @@ func TestWatchGreenGrandparentKeepsMarker(t *testing.T) {
 		t.Fatalf("grandparent dropped the marker: %+v found=%v err=%v", m, found, e)
 	}
 }
+
+func TestWatchExpiredMixedMarkerConfirms(t *testing.T) {
+	s, g, _, out, now, r := headCulpritChain(t)
+	g.blocking = true
+	if e := s.Watch(context.Background(), r, Options{}); e != nil {
+		t.Fatal(e)
+	}
+	// The window runs out while the head's failed run and a passing rerun
+	// status are still both present: the check stays ambiguous.
+	*now = now.Add(31 * time.Minute)
+	g.checkNames = map[string]map[string]github.CI{shaB: {"CI": github.Red}}
+	g.statuses = map[[2]string]statusRecord{{shaB, "CI"}: {github.Green, *now}}
+	out.Reset()
+	_ = s.Watch(context.Background(), r, Options{})
+	if strings.Contains(out.String(), "mixed result") {
+		t.Fatalf("expired marker still held as mixed: %s", out.String())
+	}
+	m, found, e := (&watchStream{Service: s}).readRedSeen(r.Name)
+	if e != nil || !found || !m.Confirmed {
+		t.Fatalf("expired marker not confirmed: %+v found=%v err=%v", m, found, e)
+	}
+}

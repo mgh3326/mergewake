@@ -227,12 +227,20 @@ func (s *watchStream) watch(ctx context.Context, r config.Repo, p policy.Policy,
 			if re != nil {
 				return re
 			}
-			// A confirmed culprit is no longer held: its pass fails as it did
-			// before the window, and the mixed hold does not repeat over it.
-			if found && m.Culprit == head && !m.Confirmed {
-				result.Action = "hold"
-				result.Reason = "mixed result: a passing rerun status sits beside the red check run; held, not reverted"
-				return s.reportWatch(ctx, r, result, head+":mixed", o)
+			// The mixed hold is for a held culprit inside its window. Once the
+			// window has run out the culprit is confirmed durably, so the hold
+			// never outlasts it; a confirmed culprit fails as it did before the
+			// window. A shadow or dry pass only reads, so it never holds here.
+			if found && m.Culprit == head && !m.Confirmed && !result.Shadow && !o.DryRun {
+				if s.Service.now().Sub(m.Since) < s.confirmWindow() {
+					result.Action = "hold"
+					result.Reason = "mixed result: a passing rerun status sits beside the red check run; held, not reverted"
+					return s.reportWatch(ctx, r, result, head+":mixed", o)
+				}
+				m.Confirmed = true
+				if re = fsutil.WriteJSON(s.redSeenFile(r.Name), m); re != nil {
+					return re
+				}
 			}
 		}
 		return e
