@@ -80,7 +80,13 @@ func baseDropRepo(t *testing.T, mode string) (root, base, head string) {
 	} else if mode == "drop_beside_feature_addition" {
 		write("legacy line\nmiddle\nend\nbase addition\n")
 	} else if strings.HasPrefix(mode, "rename_merge") {
-		write(renameFork + "base addition\n")
+		addition := "base addition\n"
+		if mode == "rename_merge_split" {
+			// Two copies of the same added text: the head may split them
+			// across the two paths, one copy each.
+			addition += addition
+		}
+		write(renameFork + addition)
 	} else if mode == "doubleplus" {
 		write("legacy line\n++counter;\n")
 	} else if mode == "paths" {
@@ -187,11 +193,11 @@ func baseDropRepo(t *testing.T, mode string) (root, base, head string) {
 		tree := baseDropGit(t, src, "write-tree")
 		later := baseDropGit(t, src, "commit-tree", tree, "-p", "HEAD", "-p", base, "-m", "later merge of base")
 		baseDropGit(t, src, "reset", "--hard", later)
-	case "rename_merge_drop", "rename_merge_carried", "rename_merge_later_carried":
+	case "rename_merge_drop", "rename_merge_carried", "rename_merge_later_carried", "rename_merge_restored_original", "rename_merge_split":
 		// The feature renames the file and a merge keeps the renamed side, which
 		// loses the base's added line. The head either carries that line under
-		// the merged path, or carries it again after a later rename, or does not
-		// carry it at all.
+		// the merged path, or carries it again after a later rename, or carries
+		// it at the original path again, or does not carry it at all.
 		baseDropGit(t, src, "mv", "tracked.txt", "renamed.txt")
 		baseDropGit(t, src, "commit", "-m", "rename file")
 		baseDropGit(t, src, "merge", "--no-ff", "-s", "ours", "main", "-m", "drop base addition")
@@ -208,6 +214,22 @@ func baseDropRepo(t *testing.T, mode string) (root, base, head string) {
 			}
 			baseDropGit(t, src, "add", "-A")
 			baseDropGit(t, src, "commit", "-m", "rename again and restore base line")
+		case "rename_merge_restored_original":
+			// A regular commit brings the base's file back under its original
+			// path, with the line, and keeps the renamed file.
+			baseDropGit(t, src, "checkout", "main", "--", "tracked.txt")
+			baseDropGit(t, src, "commit", "-m", "restore original path with base line")
+		case "rename_merge_split":
+			// Head holds one copy of the added text at each path: neither path
+			// alone holds both copies the base side had.
+			if err := os.WriteFile(filepath.Join(src, "tracked.txt"), []byte(renameFork+"base addition\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(src, "renamed.txt"), []byte(renameFork+"base addition\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			baseDropGit(t, src, "add", "-A")
+			baseDropGit(t, src, "commit", "-m", "split base line across both paths")
 		}
 	case "no_merge":
 		write("branch edit\n")
@@ -253,6 +275,13 @@ func TestGateBaseChangeDropped(t *testing.T) {
 		// The head carries the line again after a later rename: the head path
 		// follows every rename up to head.
 		{mode: "rename_merge_later_carried", want: ""},
+		// A later commit restores the file under its original path with the
+		// base's line and keeps the renamed file. The head carries the line
+		// verbatim at the original path, so it is not a drop (hk 7036).
+		{mode: "rename_merge_restored_original", want: ""},
+		// The base has two copies of the added text and the head splits them,
+		// one per path. Neither path alone holds both, so it is a drop.
+		{mode: "rename_merge_split", want: "base_change_dropped:1"},
 		// The rename is real and the head does not carry the line: a drop.
 		{mode: "rename_merge_drop", want: "base_change_dropped:1"},
 		{mode: "no_merge", want: ""},
