@@ -585,9 +585,16 @@ func (w *reviewerSweep) collect(receipts []reapReceipt) map[string]reapReceipt {
 	// its row is open. A discovery row for another host is newer, but it must
 	// not replace that host, or its worktree is never targeted once it is
 	// configured again (hk 7000).
+	// The unconfigured host stays the label's host only while no other stream
+	// owes work on a configured host: that stream's checkout must not wait for
+	// a host that may never return (hk 7011). The unconfigured host's own row
+	// stays open, so its checkout is still owed once the host is configured.
 	for label, streams := range w.streams {
 		if host := unconfiguredJobHost(streams); host != "" {
 			w.labelHost[label] = w.hostName(host)
+			if owed := w.owedConfiguredHost(streams); owed != "" {
+				w.labelHost[label] = owed
+			}
 		}
 	}
 	return lastCleanup
@@ -602,6 +609,24 @@ func unconfiguredJobHost(streams map[string]reapReceipt) string {
 	for _, v := range streams {
 		if v.Result == "kept" && v.Reason == "job-host-unconfigured" && v.Host != "" && (host == "" || v.Time.After(at)) {
 			host, at = v.Host, v.Time
+		}
+	}
+	return host
+}
+
+// owedConfiguredHost names the configured host of a label's newest open
+// worktree row: a checkout the sweep still owes a removal on that host. ""
+// when no stream of the label holds one on a configured host.
+func (w *reviewerSweep) owedConfiguredHost(streams map[string]reapReceipt) string {
+	host := ""
+	var at time.Time
+	for _, v := range streams {
+		name := w.hostName(v.Host)
+		if v.Worktree == "" || reviewerTerminal(v) || reviewerCheckoutRemoved(v) || w.scannedHost(name) == nil {
+			continue
+		}
+		if host == "" || v.Time.After(at) || (v.Time.Equal(at) && name < host) {
+			host, at = name, v.Time
 		}
 	}
 	return host
