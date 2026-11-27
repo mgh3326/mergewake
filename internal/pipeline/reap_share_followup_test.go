@@ -103,6 +103,24 @@ func TestCorruptReviewerCursorIsRepaired(t *testing.T) {
 	}
 }
 
+// The stage completes after the cursor read fails: finished sees the unreadable
+// cursor and must not replace it with a zero cursor. Only the !w.unreadable
+// guard in workerPass.finished keeps the symlink, so removing it fails here.
+func TestWorkerCursorIOErrorPreservesFileOnCompletedStage(t *testing.T) {
+	f := budgetWorkerFix(t, 3, "", 0)
+	path := filepath.Join(f.s.state(testRepo.Name), "worker-worktree-cursor.json")
+	if err := os.Symlink(path, path); err != nil {
+		t.Fatal(err)
+	}
+	err := f.reap(t, 0, Options{})
+	if err == nil || !strings.Contains(err.Error(), "worker worktrees: resume cursor") {
+		t.Fatalf("worker cursor I/O error was not reported: %v", err)
+	}
+	if info, err := os.Lstat(path); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("worker cursor path changed after I/O error on a completed stage: info=%v err=%v", info, err)
+	}
+}
+
 // The budget cuts the worker stage mid-order, so stopAt would rewrite the
 // cursor over the unreadable file. Preservation is what keeps the symlink.
 func TestWorkerCursorIOErrorPreservesFile(t *testing.T) {
