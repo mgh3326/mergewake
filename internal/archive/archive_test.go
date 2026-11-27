@@ -410,7 +410,9 @@ func TestResumeOldManifestCacheFilesAndRejectOtherDifferences(t *testing.T) {
 	t.Run("cache files resume through delete", func(t *testing.T) {
 		e := setup(t)
 		dir := filepath.Join(e.jobs, "wk-resume-old-cache")
-		write(t, filepath.Join(dir, "report.md"), "report\n")
+		// report.md is non-zero and fits the 4-byte cap, so the non-cache
+		// total is non-zero and an oversized report cannot zero it out.
+		write(t, filepath.Join(dir, "report.md"), "ok\n")
 		write(t, filepath.Join(dir, "node_modules/pkg/index.js"), "node\n")
 		write(t, filepath.Join(dir, ".venv/lib/excluded.txt"), "excluded\n")
 		write(t, filepath.Join(dir, ".gocache/build.bin"), "go cache\n")
@@ -446,7 +448,11 @@ func TestResumeOldManifestCacheFilesAndRejectOtherDifferences(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, rel := range []string{"node_modules/pkg/index.js", ".gocache/build.bin"} {
-			m.Files = append(m.Files, File{Path: rel, Size: int64(len("legacy cache")), SHA256: strings.Repeat("a", 64)})
+			f := File{Path: rel, Size: int64(len("legacy cache")), SHA256: strings.Repeat("a", 64)}
+			m.Files = append(m.Files, f)
+			// The raw manifest total includes the cache bytes, as the #592
+			// manifests did. Result.Bytes must leave them out.
+			m.TotalBytes += f.Size
 		}
 		m.Excluded = append(m.Excluded, ".venv/lib/excluded.txt")
 		m.Skipped = append(m.Skipped, "node_modules/.bin/tool")
@@ -466,6 +472,9 @@ func TestResumeOldManifestCacheFilesAndRejectOtherDifferences(t *testing.T) {
 		res, err := a.Apply(context.Background(), p, time.Now())
 		if err != nil || !res.Deleted {
 			t.Fatalf("resume apply=%+v err=%v", res, err)
+		}
+		if want := int64(len("ok\n")); fresh.Bytes != want {
+			t.Fatalf("fresh plan non-cache bytes = %d, want %d", fresh.Bytes, want)
 		}
 		if res.Files != fresh.Files || res.Bytes != fresh.Bytes || !sameStrings(res.Excluded, fresh.Excluded) {
 			t.Fatalf("resume result files/bytes/excluded = %d/%d/%v, fresh plan = %d/%d/%v", res.Files, res.Bytes, res.Excluded, fresh.Files, fresh.Bytes, fresh.Excluded)
