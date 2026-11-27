@@ -28,6 +28,11 @@ func baseDropGit(t *testing.T, dir string, args ...string) string {
 	return strings.TrimSpace(string(b))
 }
 
+// renameFork is the fork-point content of the rename fixtures: the base's
+// added line is appended after it, so a rename stays similar enough to be
+// detected.
+const renameFork = "kept one\nkept two\nkept three\nkept four\n"
+
 // baseDropRepo rebuilds the incident shape: base adds one line after the
 // fork, then the PR either drops it in an ours merge, keeps both sides in a
 // normal merge, or never merges base.
@@ -56,6 +61,9 @@ func baseDropRepo(t *testing.T, mode string) (root, base, head string) {
 	if mode == "drop_beside_feature_addition" {
 		baseText = "legacy line\nmiddle\nend\n"
 	}
+	if strings.HasPrefix(mode, "rename_merge") {
+		baseText = renameFork
+	}
 	if mode == "duplicate_other_occurrence" {
 		baseText = "func A() {\nreturn nil\n}\nfunc B() {\nreturn errors.New(\"x\")\n}\n"
 	}
@@ -71,6 +79,8 @@ func baseDropRepo(t *testing.T, mode string) (root, base, head string) {
 		write("func A() {\nreturn nil\n}\nfunc B() {\nreturn nil\nreturn errors.New(\"x\")\n}\n")
 	} else if mode == "drop_beside_feature_addition" {
 		write("legacy line\nmiddle\nend\nbase addition\n")
+	} else if strings.HasPrefix(mode, "rename_merge") {
+		write(renameFork + "base addition\n")
 	} else if mode == "doubleplus" {
 		write("legacy line\n++counter;\n")
 	} else if mode == "paths" {
@@ -177,6 +187,28 @@ func baseDropRepo(t *testing.T, mode string) (root, base, head string) {
 		tree := baseDropGit(t, src, "write-tree")
 		later := baseDropGit(t, src, "commit-tree", tree, "-p", "HEAD", "-p", base, "-m", "later merge of base")
 		baseDropGit(t, src, "reset", "--hard", later)
+	case "rename_merge_drop", "rename_merge_carried", "rename_merge_later_carried":
+		// The feature renames the file and a merge keeps the renamed side, which
+		// loses the base's added line. The head either carries that line under
+		// the merged path, or carries it again after a later rename, or does not
+		// carry it at all.
+		baseDropGit(t, src, "mv", "tracked.txt", "renamed.txt")
+		baseDropGit(t, src, "commit", "-m", "rename file")
+		baseDropGit(t, src, "merge", "--no-ff", "-s", "ours", "main", "-m", "drop base addition")
+		switch mode {
+		case "rename_merge_carried":
+			if err := os.WriteFile(filepath.Join(src, "renamed.txt"), []byte(renameFork+"base addition\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			baseDropGit(t, src, "commit", "-am", "restore base line under the new name")
+		case "rename_merge_later_carried":
+			baseDropGit(t, src, "mv", "renamed.txt", "final.txt")
+			if err := os.WriteFile(filepath.Join(src, "final.txt"), []byte(renameFork+"base addition\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			baseDropGit(t, src, "add", "-A")
+			baseDropGit(t, src, "commit", "-m", "rename again and restore base line")
+		}
 	case "no_merge":
 		write("branch edit\n")
 		baseDropGit(t, src, "commit", "-am", "edit pre-fork line")
@@ -214,6 +246,15 @@ func TestGateBaseChangeDropped(t *testing.T) {
 		// The base's added line is replaced by a combined line in the merge
 		// resolution. The head does not carry it verbatim, so it is a drop.
 		{mode: "combine", want: "base_change_dropped:1"},
+		// A merge renames the file and loses the base's added line. The head
+		// carries that line verbatim under the new path, so it is not a drop
+		// (hk 7032). Without the head lookup under the renamed path it is.
+		{mode: "rename_merge_carried", want: ""},
+		// The head carries the line again after a later rename: the head path
+		// follows every rename up to head.
+		{mode: "rename_merge_later_carried", want: ""},
+		// The rename is real and the head does not carry the line: a drop.
+		{mode: "rename_merge_drop", want: "base_change_dropped:1"},
 		{mode: "no_merge", want: ""},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
