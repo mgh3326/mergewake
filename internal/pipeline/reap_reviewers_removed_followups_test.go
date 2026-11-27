@@ -8,9 +8,10 @@ import (
 	"github.com/mgh3326/mergewake/internal/integrations"
 )
 
-// A removed stream whose inspect fails keeps its removed row: the failed probe
-// proves nothing about the tree, so no new row is written, nothing is removed,
-// and the host is not failed for its other labels (hk 6983).
+// A removed stream whose inspect fails keeps its removed proof: the failed probe
+// proves nothing about the tree, so nothing is removed, the journal keeps the
+// removed row, and the stream gets a pending re-inspect marker so the next pass
+// inspects it again (hk 6983, hk 6992). The host is not failed for its labels.
 func TestReapReviewerRemovedRowSurvivesInspectError(t *testing.T) {
 	label := reviewerLabelFor(12, time.Hour)
 	path := "/work/" + label + reviewerCheckoutSuffix
@@ -35,11 +36,14 @@ func TestReapReviewerRemovedRowSurvivesInspectError(t *testing.T) {
 		t.Fatalf("removes: %v", removes)
 	}
 	rows := f.rows(t)
-	if len(rows) != before {
-		t.Fatalf("rows grew from %d to %d: %v", before, len(rows), rowSummary(rows))
+	if len(rows) != before+1 {
+		t.Fatalf("rows: want %d, got %v", before+1, rowSummary(rows))
 	}
-	if last := rows[len(rows)-1]; last.Result != "removed" || last.Worktree != path {
-		t.Fatalf("removed row was overwritten: %v", rowSummary(rows))
+	if last := rows[len(rows)-1]; last.Result != "pending-cleanup" || last.Reason != reviewerRemovedReprobe || last.Worktree != path {
+		t.Fatalf("re-inspect marker: %v", rowSummary(rows))
+	}
+	if rows[before-1].Result != "removed" || rows[before-1].Worktree != path {
+		t.Fatalf("removed proof was lost: %v", rowSummary(rows))
 	}
 }
 

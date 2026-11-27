@@ -1,6 +1,7 @@
 package pipeline
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -61,7 +62,7 @@ func TestReapReviewerRemovedRowDoesNotHideRecreatedCheckout(t *testing.T) {
 		}
 	})
 
-	t.Run("absent tree writes nothing and removes nothing", func(t *testing.T) {
+	t.Run("absent tree settles once and removes nothing", func(t *testing.T) {
 		f := newReviewerFix(t)
 		before := seed(f)
 		if err := f.reap(t, 0, Options{}); err != nil {
@@ -70,8 +71,19 @@ func TestReapReviewerRemovedRowDoesNotHideRecreatedCheckout(t *testing.T) {
 		if removes := f.hub.ops("worktree.remove"); len(removes) != 0 {
 			t.Fatalf("removes: %v", removes)
 		}
-		if after := len(f.rows(t)); after != before {
-			t.Fatalf("rows grew from %d to %d: %v", before, after, rowSummary(f.rows(t)))
+		rows := f.rows(t)
+		if len(rows) != before+1 {
+			t.Fatalf("rows: want %d, got %v", before+1, rowSummary(rows))
+		}
+		if last := rows[len(rows)-1]; last.Result != "skipped" || !strings.HasPrefix(last.Reason, reviewerRemovedAbsent) || last.Worktree != path {
+			t.Fatalf("settle row: %v", rowSummary(rows))
+		}
+		// Within a day the settled path is not inspected again: no row, no probe.
+		if err := f.reap(t, 0, Options{}); err != nil {
+			t.Fatal(err)
+		}
+		if after := len(f.rows(t)); after != before+1 {
+			t.Fatalf("settled path was revisited: %v", rowSummary(f.rows(t)))
 		}
 	})
 }
