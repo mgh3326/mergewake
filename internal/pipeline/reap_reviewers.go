@@ -405,6 +405,9 @@ type reviewerSweep struct {
 	paneConflict map[paneKey]bool
 	// labelHost is the newest host a receipt recorded for a label.
 	labelHost map[string]string
+	// owedYield names the owed configured host a label's pin yielded to this
+	// pass; the journal merge keeps it over the audit row's host (hk 7018).
+	owedYield map[string]string
 	// rowed names labels this pass wrote a durable row for.
 	rowed map[string]bool
 	// writeFailed reports that a row could not be written, so the journal
@@ -632,12 +635,20 @@ func (w *reviewerSweep) collect(receipts []reapReceipt) map[string]reapReceipt {
 	// stays open, so its checkout is still owed once the host is configured.
 	for label, streams := range w.streams {
 		if host := unconfiguredJobHost(streams); host != "" {
-			w.labelHost[label] = w.hostName(host)
-			// The yield to an owed configured host holds only while the pinned
-			// host is still unconfigured: once it is configured again, its open
-			// row keeps the label, so its checkout is the one removed (hk 7000).
-			if owed := w.owedConfiguredHost(streams); owed != "" && w.scannedHost(w.hostName(host)) == nil {
+			name := w.hostName(host)
+			w.labelHost[label] = name
+			// The pin holds while its host is unconfigured, or configured and
+			// still owing the checkout (hk 7000). A failed pinned host, or one
+			// that already recorded the checkout gone, releases the label to an
+			// owed host (hk 7018).
+			hs := w.scannedHost(name)
+			released := hs == nil || hs.failed || pinSettled(streams, name, w)
+			if owed := w.owedConfiguredHost(streams); owed != "" && released {
 				w.labelHost[label] = owed
+				if w.owedYield == nil {
+					w.owedYield = map[string]string{}
+				}
+				w.owedYield[label] = owed
 			}
 		}
 	}
@@ -656,6 +667,24 @@ func unconfiguredJobHost(streams map[string]reapReceipt) string {
 		}
 	}
 	return host
+}
+
+// pinSettled reports whether the pinned host recorded the label's checkout on
+// it gone or removed, in a row newer than its open job-host-unconfigured row.
+// Such a pin owes nothing, and must not keep the label off the owed host.
+func pinSettled(streams map[string]reapReceipt, name string, w *reviewerSweep) bool {
+	var pinAt time.Time
+	for _, v := range streams {
+		if v.Result == "kept" && v.Reason == "job-host-unconfigured" && w.hostName(v.Host) == name && v.Time.After(pinAt) {
+			pinAt = v.Time
+		}
+	}
+	for _, v := range streams {
+		if v.Worktree != "" && v.Worktree != v.Label && w.hostName(v.Host) == name && v.Time.After(pinAt) && (reviewerTerminal(v) || reviewerCheckoutRemoved(v)) {
+			return true
+		}
+	}
+	return false
 }
 
 // owedConfiguredHost names the configured host of a label's newest open
@@ -974,6 +1003,9 @@ func (w *reviewerSweep) candidates(lastCleanup map[string]reapReceipt, prNum int
 		}
 		if host == "" {
 			host = w.labelHost[name]
+		}
+		if y := w.owedYield[name]; y != "" {
+			host = y
 		}
 		if host != "" {
 			w.labelHost[name] = host

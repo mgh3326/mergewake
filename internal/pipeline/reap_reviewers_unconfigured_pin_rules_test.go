@@ -29,14 +29,20 @@ func TestReapReviewerReconfiguredPinHostKeepsItsCheckout(t *testing.T) {
 	}
 	label := reviewerLabelFor(176, 2*24*time.Hour)
 	pathZ := "/work-z/" + label + reviewerCheckoutSuffix
+	pathB := "/work-b/" + label + reviewerCheckoutSuffix
 	f.hub.detached[pathZ] = true
+	f.hub.detached[pathB] = true
 	// node-z's row was written while node-z was unconfigured; node-b's newer
 	// open row follows it. The last receipt naming a host is node-z's.
 	seedReapRows(t, f.s, testRepo.Name,
-		reapReceipt{Time: reviewerNow.Add(-1 * time.Hour), Action: "reviewer-reap", Repo: testRepo.Name, PR: 176, Label: label, Host: "node-b", Worktree: label,
+		reapReceipt{Time: reviewerNow.Add(-1 * time.Hour), Action: "reviewer-reap", Repo: testRepo.Name, PR: 176, Label: label, Host: "node-b", Worktree: pathB, Cwd: pathB,
 			Result: "kept", Reason: "pane-in-use"},
-		reapReceipt{Time: reviewerNow.Add(-3 * time.Hour), Action: "reviewer-reap", Repo: testRepo.Name, PR: 176, Label: label, Host: "node-z", Worktree: pathZ, Cwd: pathZ,
+		// The pin row sits on node-z's label stream; node-z's checkout row sits
+		// on its path stream, which the removal later replaces.
+		reapReceipt{Time: reviewerNow.Add(-3 * time.Hour), Action: "reviewer-reap", Repo: testRepo.Name, PR: 176, Label: label, Host: "node-z", Worktree: label,
 			Result: "kept", Reason: "job-host-unconfigured"},
+		reapReceipt{Time: reviewerNow.Add(-3 * time.Hour), Action: "reviewer-reap", Repo: testRepo.Name, PR: 176, Label: label, Host: "node-z", Worktree: pathZ, Cwd: pathZ,
+			Result: "pending-cleanup", Reason: reviewerDrainHold},
 	)
 
 	if err := f.reap(t, 0, Options{}); err != nil && !strings.Contains(err.Error(), "disconnected") {
@@ -50,6 +56,52 @@ func TestReapReviewerReconfiguredPinHostKeepsItsCheckout(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("pass 1 never targeted node-z's worktree %s; removes %v; rows %v", pathZ, f.hub.ops("worktree.remove"), rowSummary(f.rows(t)))
+	}
+
+	// Pass 2: node-z's checkout is now recorded gone, so its pin releases and
+	// node-b's owed checkout is removed.
+	if err := f.reap(t, 0, Options{}); err != nil && !strings.Contains(err.Error(), "disconnected") {
+		t.Fatal(err)
+	}
+	found = false
+	for _, r := range f.hub.ops("worktree.remove") {
+		if r["cwd"] == pathB {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("pass 2 never removed node-b's owed checkout %s after node-z's pin settled; removes %v; rows %v", pathB, f.hub.ops("worktree.remove"), rowSummary(f.rows(t)))
+	}
+}
+
+// Rule 1 (finding 4715946124 on the head, befb66b): a failed pinned host yields
+// too. node-z is configured but its scan failed, so its open row must not keep
+// the label off the healthy node-b that owes a removal.
+func TestReapReviewerFailedPinnedHostYieldsToAHealthyOwedHost(t *testing.T) {
+	f := newReviewerFix(t,
+		reap.Host{Name: "node-b", Machine: "node-b", WorkRoot: "/work-b"},
+		reap.Host{Name: "node-z", Machine: "node-z", WorkRoot: "/work-z"})
+	f.s.Config.Hosts[0].WorkRoot = "/work-a"
+	f.hub.moreNodes = []any{
+		map[string]any{"machine_id": "node-b", "state": "connected", "agents": []any{}, "panes": []any{}, "panes_ok": true},
+		map[string]any{"machine_id": "node-z", "state": "disconnected"},
+	}
+	label := reviewerLabelFor(179, 2*24*time.Hour)
+	pathB := "/work-b/" + label + reviewerCheckoutSuffix
+	f.hub.detached[pathB] = true
+	seedReapRows(t, f.s, testRepo.Name,
+		reapReceipt{Time: reviewerNow.Add(-3 * time.Hour), Action: "reviewer-reap", Repo: testRepo.Name, PR: 179, Label: label, Host: "node-z", Worktree: label,
+			Result: "kept", Reason: "job-host-unconfigured"},
+		reapReceipt{Time: reviewerNow.Add(-2 * time.Hour), Action: "reviewer-reap", Repo: testRepo.Name, PR: 179, Label: label, Host: "node-b", Worktree: pathB, Cwd: pathB,
+			Result: "pending-cleanup", Reason: reviewerDrainHold},
+	)
+
+	// The down node-z is the pass's own scan report; only the removal matters.
+	if err := f.reap(t, 0, Options{}); err != nil && !strings.Contains(err.Error(), "disconnected") {
+		t.Fatal(err)
+	}
+	if removes := f.hub.ops("worktree.remove"); len(removes) != 1 || removes[0]["cwd"] != pathB {
+		t.Fatalf("pass 1 removes %v, want node-b's owed checkout %s while node-z is down; rows %v", removes, pathB, rowSummary(f.rows(t)))
 	}
 }
 
