@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/mgh3326/mergewake/internal/reap"
 )
@@ -47,8 +48,10 @@ func (s *Service) reapHostScan(ctx context.Context, hub *reap.Hub, h reap.Host) 
 	if pass == nil {
 		return s.reapScanHost(ctx, hub, h)
 	}
+	waited := time.Now()
 	pass.mu.Lock()
 	defer pass.mu.Unlock()
+	telemetryFrom(ctx).Wait("host-scan-lock", time.Since(waited))
 	if sc, ok := pass.scans[h.Name]; ok {
 		return s.rebindHostScan(ctx, hub, sc.hs), sc.errs
 	}
