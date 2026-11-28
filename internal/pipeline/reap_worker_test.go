@@ -439,6 +439,54 @@ func TestWorkerWorktreeStaleFirstRegistrationDoesNotDropTheClone(t *testing.T) {
 	}
 }
 
+// A clone whose every registration is stale (its directory is gone) is skipped
+// for the pass: no pass error, nothing removed, and one skipped row per UTC day.
+func TestWorkerWorktreeStaleOnlyCloneIsSkippedNotAnError(t *testing.T) {
+	s, hub, _ := workerFixture(t, workerPR(40, true, "abc123"))
+	jobState(s, "job", "completed")
+	hub.lists[workerCommon] = []map[string]any{
+		listedRow("/work/project", "main"),
+		listedRow("/work/gone.wt", "wk/gone"),
+	}
+	for pass := 1; pass <= 2; pass++ {
+		if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+			t.Fatalf("pass %d error: %v", pass, err)
+		}
+	}
+	if n := len(hub.ops("worktree.remove")); n != 0 {
+		t.Fatalf("removes: %d", n)
+	}
+	var skips []map[string]any
+	for _, r := range workerLogRows(t, s) {
+		if r["reason"] == "repository-identity-inconclusive" {
+			skips = append(skips, r)
+		}
+	}
+	if len(skips) != 1 || skips[0]["result"] != "skipped" {
+		t.Fatalf("skipped rows %d, want one per UTC day: %v", len(skips), skips)
+	}
+}
+
+// A stale registration beside one whose inspect errors still reports the error:
+// an unproven clone is never admitted, and the failure is not hidden as stale.
+func TestWorkerWorktreeErroredInspectStillReported(t *testing.T) {
+	s, hub, _ := workerFixture(t, workerPR(40, true, "abc123"))
+	jobState(s, "job", "completed")
+	hub.lists[workerCommon] = []map[string]any{
+		listedRow("/work/project", "main"),
+		listedRow("/work/gone.wt", "wk/gone"),
+		listedRow("/work/err.wt", "wk/err"),
+	}
+	hub.inspectErr = map[string]string{"/work/err.wt": "worktree_unavailable"}
+	err := s.Reap(context.Background(), testRepo, 0, Options{})
+	if err == nil || !strings.Contains(err.Error(), "/work/err.wt") {
+		t.Fatalf("error %v, want the inspect failure of /work/err.wt", err)
+	}
+	if n := len(hub.ops("worktree.remove")); n != 0 {
+		t.Fatalf("removes: %d", n)
+	}
+}
+
 // A past removed row does not hide a worktree that is checked out again.
 func TestWorkerWorktreeRecreatedAtSamePathIsEvaluated(t *testing.T) {
 	s, hub, _ := workerFixture(t, workerPR(40, true, "abc123"))
