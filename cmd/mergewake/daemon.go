@@ -119,6 +119,13 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 			// The pr role runs every repository at once: a pass is as long as
 			// its slowest repository, not their sum, so no repository starves
 			// behind the others when the daemon restarts often.
+			// The reap pass's own accounting: each repository's stages, and the
+			// legacy sweep, add up to one pass summary row.
+			var reapPass *pipeline.ReapPass
+			passStarted := time.Now()
+			if role == "reap" {
+				reapPass = pipeline.NewReapPass()
+			}
 			var passSkips reapPassSkips
 			err := forRepos(ctx, repos, role == "pr", func(ctx context.Context, r config.Repo) error {
 				repoCtx, repoSpan := tracing.Span(ctx, "mergewake.repo")
@@ -143,10 +150,12 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 					case "reap":
 						sweepCtx, span := tracing.Span(ctx, "mergewake.reap")
 						sweepCtx, telemetry := pipeline.WithReapTelemetry(sweepCtx)
+						telemetry.SetGitHub(counts.RequestTimeTotal, func() int { return requestTotal(counts.Snapshot()) })
 						started := time.Now()
 						githubBefore := counts.RequestTimeTotal()
 						githubCallsBefore := requestTotal(counts.Snapshot())
 						err = s.Reap(sweepCtx, r, 0, o)
+						reapPass.Add(telemetry)
 						elapsed := time.Since(started)
 						githubMS := (counts.RequestTimeTotal() - githubBefore).Milliseconds()
 						githubCalls := requestTotal(counts.Snapshot()) - githubCallsBefore
@@ -193,10 +202,17 @@ func runDaemonLoops(ctx context.Context, s *pipeline.Service, gh *github.Client,
 				// due. Its failure is audited by ReapLegacy and logged here,
 				// never failing the role or the next regular reap.
 				legacyCtx, span := tracing.Span(ctx, "mergewake.reap-legacy")
+				legacyCtx, legacy := pipeline.WithReapTelemetry(legacyCtx)
+				legacy.SetGitHub(counts.RequestTimeTotal, func() int { return requestTotal(counts.Snapshot()) })
+				legacy.Stage("legacy sweep", nil)
 				if e := s.ReapLegacyScheduled(legacyCtx, repos, o); e != nil {
 					log.Error("legacy sweep", "error", e)
 				}
+				reapPass.Add(legacy)
 				tracing.Finish(span)
+			}
+			if reapPass != nil {
+				log.Info("reap pass summary", "summary", reapPass.Summary(time.Since(passStarted), gh.RateWait()))
 			}
 			return err
 		}})
