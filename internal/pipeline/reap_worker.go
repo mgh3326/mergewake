@@ -403,6 +403,19 @@ func (w *workerPass) discover(ctx context.Context, hs *reapHost, note func(reapR
 // registered worktree is stale, so no pass can prove its identity yet.
 const inconclusiveCloneReason = "repository-identity-inconclusive"
 
+// inconclusiveCloneAction is the action of that skipped row. It is not
+// remove-worktree: the clone is never removed, so the worker-worktree and
+// author-sweep tallies must not count it as made.
+const inconclusiveCloneAction = "clone-identity"
+
+// inconclusiveCloneRow reports whether v is a clone's once-a-day skipped row.
+// It is never compared against the stream's previous row: the same clone keeps
+// the same key and signature on every day, and the day gate in
+// noteInconclusiveClone already limits it to one a day.
+func inconclusiveCloneRow(v reapReceipt) bool {
+	return v.Action == inconclusiveCloneAction && v.Reason == inconclusiveCloneReason
+}
+
 // noteInconclusiveClone records one skipped row for an untrusted clone whose
 // registrations are all stale, at most once per clone per UTC day, so the skip
 // stays visible without repeating on every pass.
@@ -413,12 +426,12 @@ func (w *workerPass) noteInconclusiveClone(hs *reapHost, clone workerClone, note
 		return fmt.Errorf("%s clone %s: receipts: %w", hs.host.Name, clone.main, e)
 	}
 	for _, v := range receipts {
-		if v.Host == hs.host.Name && v.Worktree == clone.main && v.Reason == inconclusiveCloneReason &&
+		if inconclusiveCloneRow(v) && v.Host == hs.host.Name && v.Worktree == clone.main &&
 			v.Time.UTC().Format(reviewerSummaryDay) == day {
 			return nil
 		}
 	}
-	note(reapReceipt{Action: "remove-worktree", Repo: w.r.Name, Host: hs.host.Name, Worktree: clone.main,
+	note(reapReceipt{Action: inconclusiveCloneAction, Repo: w.r.Name, Host: hs.host.Name, Worktree: clone.main,
 		Result: "skipped", Reason: inconclusiveCloneReason, Source: workerSource})
 	return nil
 }
