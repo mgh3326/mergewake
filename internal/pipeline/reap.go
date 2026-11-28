@@ -1031,8 +1031,9 @@ func (s *Service) Reap(ctx context.Context, r config.Repo, prNum int, o Options)
 		// and hk record. The day's process-scan-unavailable row always
 		// appends too: its reason can stay identical for days while the
 		// sweep stays blocked, and the day gate already limits it to one a
-		// day (hk 4792).
-		repeat := h.lastRow[reapRowKey(v)] == reapRowSig(v) && !dailyScanRow(v) && !(v.Action == "archive-job" && (v.Result == "error" || v.Result == "archived" || v.Result == "archived-retained"))
+		// day (hk 4792). A clone's stale-only skip is the same kind of day
+		// row (hk 7123).
+		repeat := h.lastRow[reapRowKey(v)] == reapRowSig(v) && !dailyScanRow(v) && !inconclusiveCloneRow(v) && !(v.Action == "archive-job" && (v.Result == "error" || v.Result == "archived" || v.Result == "archived-retained"))
 		h.lastRow[reapRowKey(v)] = reapRowSig(v)
 		return s.reapNote(v, o.DryRun || repeat)
 	}

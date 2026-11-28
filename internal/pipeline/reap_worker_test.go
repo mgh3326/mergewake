@@ -457,13 +457,88 @@ func TestWorkerWorktreeStaleOnlyCloneIsSkippedNotAnError(t *testing.T) {
 		t.Fatalf("removes: %d", n)
 	}
 	var skips []map[string]any
-	for _, r := range workerLogRows(t, s) {
+	for _, r := range reapLogRows(t, s, "example/project") {
 		if r["reason"] == "repository-identity-inconclusive" {
 			skips = append(skips, r)
 		}
 	}
 	if len(skips) != 1 || skips[0]["result"] != "skipped" {
 		t.Fatalf("skipped rows %d, want one per UTC day: %v", len(skips), skips)
+	}
+}
+
+// The stale-only skip is one row per clone per UTC day, not one per pass: the
+// second UTC day gets its own row, and a pass within a day writes nothing.
+func TestWorkerWorktreeStaleOnlyCloneWritesOneRowPerUTCDay(t *testing.T) {
+	s, hub, _ := workerFixture(t, workerPR(40, true, "abc123"))
+	jobState(s, "job", "completed")
+	hub.lists[workerCommon] = []map[string]any{
+		listedRow("/work/project", "main"),
+		listedRow("/work/gone.wt", "wk/gone"),
+	}
+	skipRows := func() int {
+		n := 0
+		for _, r := range reapLogRows(t, s, "example/project") {
+			if r["reason"] == "repository-identity-inconclusive" {
+				n++
+			}
+		}
+		return n
+	}
+	day1 := time.Date(2026, 11, 27, 9, 0, 0, 0, time.UTC)
+	day2 := day1.AddDate(0, 0, 1)
+	passes := []struct {
+		at   time.Time
+		want int
+	}{
+		{day1, 1},
+		{day1.Add(time.Hour), 1},
+		{day2, 2},
+		{day2.Add(time.Hour), 2},
+	}
+	for i, p := range passes {
+		s.Now = func() time.Time { return p.at }
+		if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+			t.Fatalf("pass %d error: %v", i+1, err)
+		}
+		if n := skipRows(); n != p.want {
+			t.Fatalf("pass %d at %s: skipped rows %d, want %d", i+1, p.at.Format(time.DateOnly), n, p.want)
+		}
+	}
+}
+
+// The stale-only skip is its own action, so no worker-worktree or author-sweep
+// tally counts the main clone as a made worktree.
+func TestWorkerWorktreeStaleOnlyCloneIsOutsideWorktreeTallies(t *testing.T) {
+	s, hub, _ := workerFixture(t, workerPR(40, true, "abc123"))
+	jobState(s, "job", "completed")
+	hub.lists[workerCommon] = []map[string]any{
+		listedRow("/work/project", "main"),
+		listedRow("/work/gone.wt", "wk/gone"),
+	}
+	day := time.Date(2026, 11, 27, 9, 0, 0, 0, time.UTC)
+	s.Now = func() time.Time { return day }
+	if err := s.Reap(context.Background(), testRepo, 0, Options{}); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(reapLogRows(t, s, "example/project")); n != 1 {
+		t.Fatalf("reap rows %d, want the one skipped row", n)
+	}
+	var scanned int
+	if err := s.workerWorktreeScan(s.Config.Repos, func(workerWorktreeRow) { scanned++ }); err != nil {
+		t.Fatal(err)
+	}
+	if scanned != 0 {
+		t.Fatalf("worker worktree rows %d, want 0", scanned)
+	}
+	res, err := s.livenessForDay(s.Config.Repos, day.Format(reviewerSummaryDay))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range res.Mechanisms {
+		if m.Mechanism == MechAuthorWorktreeSweep && m.Made != 0 {
+			t.Fatalf("author-worktree-sweep made %d, want 0", m.Made)
+		}
 	}
 }
 
