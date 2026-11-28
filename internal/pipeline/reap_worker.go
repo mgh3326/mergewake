@@ -101,7 +101,7 @@ func (s *Service) reapWorkerWorktrees(ctx context.Context, r config.Repo, hosts 
 			}
 			continue
 		}
-		found, listErrs := w.discover(ctx, hs)
+		found, listErrs := w.discover(ctx, hs, note)
 		errs = append(errs, listErrs...)
 		cands[hs] = found
 		total += len(found)
@@ -285,7 +285,7 @@ type workerCand struct {
 // the worker branches. Clones are the common dirs reap already knows from
 // panes, plus the configured clone `<work_root>/<repo>`; a worktree no pane,
 // receipt or job record names is still found.
-func (w *workerPass) discover(ctx context.Context, hs *reapHost) ([]workerCand, []error) {
+func (w *workerPass) discover(ctx context.Context, hs *reapHost, note func(reapReceipt)) ([]workerCand, []error) {
 	lister, ok := hs.ops.(reap.WorktreeLister)
 	if !ok {
 		return nil, nil
@@ -351,15 +351,18 @@ func (w *workerPass) discover(ctx context.Context, hs *reapHost) ([]workerCand, 
 			// inconclusive, a proven origin and common dir admit the clone,
 			// and a verified mismatch refuses it. None proven keeps it out.
 			sort.Slice(listed, func(i, j int) bool { return listed[i].path < listed[j].path })
-			admitted, proven := false, false
+			admitted, proven, errored := false, false, false
+			stale := 0
 			for _, c := range listed {
 				wt, e := hs.ops.Inspect(ctx, c.path)
 				switch {
 				case e != nil:
+					errored = true
 					errs = append(errs, hostUnreachableFailure(hs.host.Name, fmt.Errorf("%s %s repository identity: %w", hs.host.Name, c.path, e)))
 				case wt == nil:
 					// A registered worktree whose directory is gone: stale,
 					// inconclusive.
+					stale++
 				case !strings.EqualFold(wt.Repo, w.r.Name) || filepath.Clean(wt.Common) != clone.common:
 					// A proven different repository or clone: refuse the
 					// whole path guess.
@@ -372,7 +375,16 @@ func (w *workerPass) discover(ctx context.Context, hs *reapHost) ([]workerCand, 
 				}
 			}
 			if !admitted {
-				if !proven {
+				switch {
+				case proven:
+					// A verified mismatch refuses the clone silently.
+				case !errored && stale == len(listed):
+					// Only stale registrations: nothing proves or refutes the
+					// clone this pass. Skipped, not a pass error.
+					if e := w.noteInconclusiveClone(hs, clone, note); e != nil {
+						errs = append(errs, e)
+					}
+				default:
 					errs = append(errs, fmt.Errorf("%s clone %s: repository identity not established", hs.host.Name, clone.main))
 				}
 				continue
@@ -385,6 +397,30 @@ func (w *workerPass) discover(ctx context.Context, hs *reapHost) ([]workerCand, 
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].path < out[j].path })
 	return out, errs
+}
+
+// inconclusiveCloneReason names the skipped row of a clone whose every
+// registered worktree is stale, so no pass can prove its identity yet.
+const inconclusiveCloneReason = "repository-identity-inconclusive"
+
+// noteInconclusiveClone records one skipped row for an untrusted clone whose
+// registrations are all stale, at most once per clone per UTC day, so the skip
+// stays visible without repeating on every pass.
+func (w *workerPass) noteInconclusiveClone(hs *reapHost, clone workerClone, note func(reapReceipt)) error {
+	day := w.now.UTC().Format(reviewerSummaryDay)
+	receipts, e := w.s.reapReceipts(w.r.Name)
+	if e != nil {
+		return fmt.Errorf("%s clone %s: receipts: %w", hs.host.Name, clone.main, e)
+	}
+	for _, v := range receipts {
+		if v.Host == hs.host.Name && v.Worktree == clone.main && v.Reason == inconclusiveCloneReason &&
+			v.Time.UTC().Format(reviewerSummaryDay) == day {
+			return nil
+		}
+	}
+	note(reapReceipt{Action: "remove-worktree", Repo: w.r.Name, Host: hs.host.Name, Worktree: clone.main,
+		Result: "skipped", Reason: inconclusiveCloneReason, Source: workerSource})
+	return nil
 }
 
 // repoSegment is the clone directory name panewire prepares under a host's
